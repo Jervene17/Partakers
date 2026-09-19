@@ -19,6 +19,38 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+# --- Auto-retry on Google Sheets rate limits (429) ---
+# Patches gspread's transport layer once, at import time, so every read/write
+# anywhere in this file gets automatic exponential-backoff retry — no need to
+# wrap each of the many .get_all_records()/.append_rows()/etc. call sites
+# individually. Only retries 429 (quota exceeded); any other error still
+# raises immediately.
+import time
+import logging
+from gspread.http_client import HTTPClient as _GspreadHTTPClient
+from gspread.exceptions import APIError as _GspreadAPIError
+
+_original_gspread_request = _GspreadHTTPClient.request
+
+
+def _gspread_request_with_retry(self, *args, **kwargs):
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            return _original_gspread_request(self, *args, **kwargs)
+        except _GspreadAPIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429 and attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.random()
+                logging.warning(f"Sheets API rate limited (429) — retrying in {wait:.1f}s (attempt {attempt + 1})")
+                time.sleep(wait)
+                continue
+            raise
+
+
+_GspreadHTTPClient.request = _gspread_request_with_retry
+
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -4493,7 +4525,19 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(cancel_role_conv)
-
+# --- Global error handler: reply to the user instead of failing silently ---
+# python-telegram-bot logs "No error handlers are registered" and swallows
+# any unhandled exception otherwise — the person who triggered it never
+# hears back at all. This registers one in build_app() below.
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logging.getLogger(__name__).error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong on my end — please try that again in a moment."
+            )
+        except Exception:
+            pass
     return app
 
 
