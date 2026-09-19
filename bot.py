@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 import calendar
@@ -66,6 +67,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 CHURCH_TZ = ZoneInfo("Asia/Manila")  # adjust if the church is elsewhere
+
+
+def today_local():
+    """Today's date in the church's timezone (the server itself is usually UTC,
+    which is a day behind Manila for ~8 hours every day)."""
+    return dt.datetime.now(CHURCH_TZ).date()
+
 
 # Selectable in place of a person for any role, on any service EXCEPT Sun
 # Stop Sundays, when that service is a live broadcast relayed from another
@@ -245,7 +253,7 @@ def setup_sheet():
         else:
             ws = ss.worksheet(tab)
             if ws.row_values(1) != TAB_HEADERS[tab]:
-                ws.update("A1", [TAB_HEADERS[tab]])
+                ws.update(range_name="A1", values=[TAB_HEADERS[tab]])
 
     # seed roster (individuals across all services, plus Sun Stop Sundays departments,
     # so equal-share counts stay consistent whichever service/tab you generate from)
@@ -400,22 +408,18 @@ def load_assignment_counts(ss):
 
 
 def save_assignment_counts(ss, counts):
-    """Writes updated AssignmentCount values back to the Roster tab,
-    adding any names not already present."""
+    """Writes updated AssignmentCount values back to the Roster tab in a
+    single batched update (instead of one API call per person), adding any
+    names not already present."""
     roster_ws = ss.worksheet("Roster")
-    rows = roster_ws.get_all_records()
-    name_to_row = {row["Name"]: i + 2 for i, row in enumerate(rows)}  # 1-indexed + header
-
-    updates = []
-    new_rows = []
-    for name, count in counts.items():
-        if name in name_to_row:
-            updates.append((name_to_row[name], count))
-        else:
-            new_rows.append([name, count])
-
-    for row_num, count in updates:
-        roster_ws.update_cell(row_num, 2, count)
+    names = [row["Name"] for row in roster_ws.get_all_records()]
+    if names:
+        roster_ws.update(
+            range_name=f"B2:B{len(names) + 1}",
+            values=[[counts.get(n, 0)] for n in names],
+        )
+    known = set(names)
+    new_rows = [[n, c] for n, c in counts.items() if n not in known]
     if new_rows:
         roster_ws.append_rows(new_rows)
 
@@ -489,7 +493,7 @@ def dates_in_month(year, month, weekday):
 def upcoming_mondays(n=6):
     """List of the next n Mondays (including today if today is Monday),
     used as week-picker options for Predawn."""
-    today = dt.date.today()
+    today = today_local()
     days_ahead = (0 - today.weekday()) % 7
     first_monday = today + dt.timedelta(days=days_ahead)
     return [first_monday + dt.timedelta(weeks=i) for i in range(n)]
@@ -501,6 +505,14 @@ def dates_in_week(monday, weekdays):
     return [monday + dt.timedelta(days=w) for w in weekdays]
 
 
+def week_dates(service, monday):
+    """Dates covered by a weekly-cadence service for the week starting `monday`.
+    Predawn only runs Monday-Saturday; other weekly services use all 7 days."""
+    if service == "Predawn":
+        return dates_in_week(monday, PREDAWN_WEEKDAYS)
+    return [monday + dt.timedelta(days=i) for i in range(7)]
+
+
 def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude=None):
     """Pick from eligible people, weighted toward whoever has the fewest
     total assignments so far (equal share, combined across all roles).
@@ -510,8 +522,11 @@ def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude
       hard_exclude = role-specific hard rule, e.g. Filipino Preacher -> Presider)
     - soft_exclude: avoided when a valid alternative exists, but allowed if
       it's the only option left (e.g. Filipino Preacher -> other roles)
-    Ties broken randomly.
+    Ties broken randomly. Returns None if the role has nobody eligible at all.
     """
+    if not eligible:
+        return None
+
     hard_exclude = hard_exclude or set()
     soft_exclude = soft_exclude or set()
 
@@ -602,6 +617,8 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                     | set(unavailable.get(date_str, ()))
                 soft_exclude = {fil_preacher} if (fil_preacher and role != "Presider") else set()
                 person = pick_partaker(eligible, counts, taken_today, hard_exclude, soft_exclude)
+                if person is None:
+                    continue  # nobody eligible for this role — leave it unassigned
                 taken_today.add(person)
                 counts[person] += 1
                 schedule_rows.append((date_str, role, person))
@@ -635,6 +652,8 @@ def generate_predawn_schedule(dates, counts, preacher_assignments, roles=None, a
                 rows.append((date_str, role, already_filled[(date_str, role)]))
                 continue
             person = pick_partaker(eligible, counts, taken_today)
+            if person is None:
+                continue
             taken_today.add(person)
             counts[person] += 1
             rows.append((date_str, role, person))
@@ -665,6 +684,8 @@ def generate_simple_schedule(dates, roles, counts, already_filled=None, unavaila
                 rows.append((date_str, role, already_filled[(date_str, role)]))
                 continue
             person = pick_partaker(eligible, counts, taken_today, hard_exclude=set(unavailable.get(date_str, ())))
+            if person is None:
+                continue  # nobody eligible for this role — leave it unassigned
             taken_today.add(person)
             counts[person] += 1
             rows.append((date_str, role, person))
@@ -718,7 +739,7 @@ MONTH_LOOKAHEAD = 6  # how many upcoming months to offer as buttons
 
 
 def month_keyboard(prefix=""):
-    today = dt.date.today()
+    today = today_local()
     options = []
     y, m = today.year, today.month
     for _ in range(MONTH_LOOKAHEAD):
@@ -952,10 +973,13 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("Generating schedule...")
 
-    # Filipino Preacher exclusions only apply to Sunday. Left empty here
-    # until the FilipinoTranslation generator (later phase) writes real data;
-    # get_preacher_assignments-style reader for that tab plugs in here.
-    filipino_preacher_assignments = {}
+    # Filipino Preacher exclusions only apply to Sunday: whoever is the
+    # Filipino Preacher that date can't be Presider (hard) and is avoided
+    # for other roles when possible (soft). Read from the FilipinoTranslation tab.
+    filipino_preacher_assignments = (
+        get_role_assignments(ss, "FilipinoTranslation", "Filipino Preacher", dates)
+        if service_type == "Sunday" else {}
+    )
 
     # Slots already claimed via a preference round (or any manual write)
     # get skipped rather than re-picked. "Preacher" is excluded here since
@@ -1043,7 +1067,11 @@ async def predawn_pattern_ask_day(update: Update, context: ContextTypes.DEFAULT_
         pattern = get_predawn_pattern(ss)
         lines = "\n".join(f"{WEEKDAY_NAMES[i]}: {pattern.get(i, 'TBA')}" for i in range(len(WEEKDAY_NAMES)))
         await send(f"Predawn weekly pattern set:\n{lines}\n\nNow let's generate a month from it.")
-        return await predawn_ask_month(update, context)
+        # Post the month prompt as a NEW message so the pattern summary above
+        # isn't immediately overwritten by an edit of the same message.
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("Generate Predawn for which month?", reply_markup=month_keyboard())
+        return PREDAWN_GEN_MONTH
 
     eligible = get_role_pool(ss, "Predawn", "Preacher")
     current = get_predawn_pattern(ss).get(idx)
@@ -1516,12 +1544,11 @@ async def add_service_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if cadence == "week":
         monday = context.user_data["add_svc_mondays"][int(query.data)]
-        dates = [monday + dt.timedelta(days=i) for i in range(7)]
+        dates = week_dates(service, monday)
     else:
         year, month = map(int, query.data.split("-"))
-        # custom monthly services default to Sunday — same assumption noted
-        # for /generate_service; flag if a future service needs otherwise.
-        dates = dates_in_month(year, month, 6)
+        # custom monthly services default to Sunday (see get_service_month_dates)
+        dates = get_service_month_dates(ss, service, year, month)
 
     action = context.user_data["add_svc_action"]
     if action == "generate":
@@ -1667,14 +1694,12 @@ async def generate_service_period(update: Update, context: ContextTypes.DEFAULT_
 
     if cfg["cadence"] == "week":
         monday = context.user_data["gen_svc_mondays"][int(query.data)]
-        dates = [monday + dt.timedelta(days=i) for i in range(7)]
+        dates = week_dates(service, monday)
     else:
         year, month = map(int, query.data.split("-"))
-        # generic services default to every day-of-week matching the first
-        # random role's weekday isn't well-defined without a fixed weekday,
-        # so custom monthly services are assumed weekly-on-Sunday unless
-        # noted otherwise — flagged for follow-up if that's ever wrong.
-        dates = dates_in_month(year, month, 6)
+        # built-in services use their real weekday (e.g. FilipinoTranslation ->
+        # Sunday); custom monthly services default to Sunday.
+        dates = get_service_month_dates(ss, service, year, month)
 
     random_roles = {r: cfg["roles"][r]["eligible"] for r in cfg["roles"] if cfg["roles"][r]["mode"] == "random"}
     manual_roles = [r for r in cfg["roles"] if cfg["roles"][r]["mode"] == "manual"]
@@ -1767,10 +1792,11 @@ async def log_role_select_period(update: Update, context: ContextTypes.DEFAULT_T
 
     if cadence == "week":
         monday = context.user_data["log_role_mondays"][int(query.data)]
-        dates = [monday + dt.timedelta(days=i) for i in range(7)]
+        dates = week_dates(service, monday)
     else:
         year, month = map(int, query.data.split("-"))
-        dates = dates_in_month(year, month, 6)
+        # real weekday for built-ins (Wednesday -> Wednesdays), Sunday for custom
+        dates = get_service_month_dates(ss, service, year, month)
 
     existing = get_role_assignments(ss, service, role, dates)
     pending = [d for d in dates if d.isoformat() not in existing]
@@ -1877,7 +1903,7 @@ def rows_in_dates(records, dates):
 def nearest_date_rows(records):
     """All rows for the earliest date that is today or later. Empty list
     if nothing upcoming is scheduled."""
-    today = dt.date.today().isoformat()
+    today = today_local().isoformat()
     upcoming = sorted({r["Date"] for r in records if r.get("Date", "") >= today})
     if not upcoming:
         return []
@@ -1965,12 +1991,12 @@ async def pull_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.data == "nearest":
         rows = nearest_date_rows(records)
     elif query.data == "week":
-        today = dt.date.today()
+        today = today_local()
         monday = today - dt.timedelta(days=today.weekday())
         dates = dates_in_week(monday, PREDAWN_WEEKDAYS)
         rows = rows_in_dates(records, dates)
     else:  # month
-        today = dt.date.today()
+        today = today_local()
         rows = rows_in_month(records, today.year, today.month)
 
     if not rows:
@@ -2149,6 +2175,10 @@ def format_daily_reminder(service_type, date, rows):
     return f"{header}{body}\n\nReminder: please prepare for tomorrow's service."
 
 
+# NOTE: reminders are sent as plain text (no parse_mode). The Wednesday prep
+# block contains a literal "*", which made Telegram's Markdown parser reject
+# the whole message.
+
 async def send_sunday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Runs daily at 8:30PM but only actually sends on Wednesday — reminds
     about the upcoming Sunday service (4 days out)."""
@@ -2162,7 +2192,7 @@ async def send_sunday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
     target = now.date() + dt.timedelta(days=4)
     rows = get_rows_for_date(ss, "Sunday", target)
     text = format_daily_reminder("Sunday", target, rows)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def send_wednesday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -2178,7 +2208,7 @@ async def send_wednesday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
     target = now.date() + dt.timedelta(days=3)
     rows = get_rows_for_date(ss, "Wednesday", target)
     text = format_daily_reminder("Wednesday", target, rows)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -2204,7 +2234,7 @@ async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
     if partaker_chat_id:
         rows = get_rows_for_date(ss, "SunStopSundays", target)
         text = format_daily_reminder("SunStopSundays", target, rows)
-        await context.bot.send_message(chat_id=partaker_chat_id, text=text, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=partaker_chat_id, text=text)
 
 
 # --- /set_group_chat: run inside a Telegram group to register it as the
@@ -2541,7 +2571,6 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
     role = context.user_data["sub_role"]
     ws = ss.worksheet(service)
     _, current = get_role_row(ws, role, date_str)
-    eligible = get_role_pool(ss, service, role)
     candidates = available_replacements(ss, service, date_str, role, current)
     buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in candidates]
     if current != LIVE_BROADCAST and service != "SunStopSundays":
@@ -2634,7 +2663,7 @@ CANCEL_SERVICE, CANCEL_NAME, CANCEL_PICK, CANCEL_REPLACEMENT, CANCEL_CONFIRM = r
 def upcoming_assignments(ws, name=None):
     """[(date_str, role, partaker)] from today on, earliest first. Optionally
     only for one person. Live Broadcast rows are skipped."""
-    today = dt.datetime.now(CHURCH_TZ).date().isoformat()
+    today = today_local().isoformat()
     out = []
     for r in ws.get_all_records():
         date_str, person = str(r.get("Date", "")), r.get("Partaker")
@@ -3093,12 +3122,10 @@ async def template_select_period(update: Update, context: ContextTypes.DEFAULT_T
 
     if cadence == "week":
         monday = context.user_data["template_mondays"][int(query.data)]
-        dates = [monday + dt.timedelta(days=i) for i in range(7)]
+        dates = week_dates(service, monday)
     else:
         year, month = map(int, query.data.split("-"))
-        dates = dates_in_month(year, month, 6) if service not in SERVICE_WEEKDAY else dates_in_month(
-            year, month, SERVICE_WEEKDAY[service]
-        )
+        dates = get_service_month_dates(ss, service, year, month)
 
     rows = build_template_rows(ss, service, dates)
     path = f"/tmp/{service}_template.csv"
@@ -3116,7 +3143,7 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
     — no admin needs to remember which command started it, since the file
     carries its own Service/Date/Role columns."""
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".csv"):
+    if not doc.file_name or not doc.file_name.lower().endswith(".csv"):
         return
 
     import csv
@@ -3126,19 +3153,28 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
 
     ss = setup_sheet()
     by_service = defaultdict(list)
-    with open(path, newline="") as f:
+    # utf-8-sig strips the BOM that Excel adds, which would otherwise turn the
+    # first header into "\ufeffService" and break the lookup below.
+    with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             partaker = (row.get("Partaker") or "").strip()
             if not partaker:
                 continue
-            by_service[row["Service"].strip()].append((row["Date"].strip(), row["Role"].strip(), partaker))
+            by_service[(row.get("Service") or "").strip()].append(
+                ((row.get("Date") or "").strip(), (row.get("Role") or "").strip(), partaker)
+            )
 
     if not by_service:
         await update.message.reply_text("No filled-in rows found in that file — nothing to update.")
         return
 
+    known_tabs = {ws.title for ws in ss.worksheets()}
     total = 0
+    skipped = []
     for service, entries in by_service.items():
+        if service not in known_tabs:
+            skipped.append(service or "(blank)")
+            continue
         ws = ss.worksheet(service)
         records = ws.get_all_records()
         row_index = {(r["Date"], r["Role"]): i + 2 for i, r in enumerate(records)}
@@ -3153,7 +3189,10 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
         if new_rows:
             ws.append_rows(new_rows)
 
-    await update.message.reply_text(f"Bulk upload processed: {total} entr{'y' if total == 1 else 'ies'} updated.")
+    msg = f"Bulk upload processed: {total} entr{'y' if total == 1 else 'ies'} updated."
+    if skipped:
+        msg += f"\nSkipped unknown service(s): {', '.join(skipped)}"
+    await update.message.reply_text(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -3225,7 +3264,7 @@ def build_service_dashboard_grid(ss, service, months_ahead=DASHBOARD_MONTHS_AHEA
     configs = load_service_configs(ss)
     roles = list(configs.get(service, {}).get("roles", {}).keys()) or get_distinct_roles(ws)
 
-    today = dt.date.today()
+    today = today_local()
     months = month_range(today.year, today.month, months_ahead)
     # also include any month that already has data further out, so
     # already-generated future schedules never get hidden by the window
@@ -3444,17 +3483,17 @@ def reset_roster_counts(ss):
     renewal so the new year's equal-share generation starts fresh rather
     than inheriting the outgoing year's balance."""
     roster_ws = ss.worksheet("Roster")
-    records = roster_ws.get_all_records()
-    for i in range(len(records)):
-        roster_ws.update_cell(i + 2, 2, 0)
-    return len(records)
+    n = len(roster_ws.get_all_records())
+    if n:
+        roster_ws.update(range_name=f"B2:B{n + 1}", values=[[0]] * n)
+    return n
 
 
 RENEW_CONFIRM = 110
 
 
 async def renew_year_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    year = dt.date.today().year
+    year = today_local().year
     buttons = [
         [InlineKeyboardButton(f"Yes, archive {year}", callback_data=str(year))],
         [InlineKeyboardButton("Cancel", callback_data="cancel")],
@@ -3541,7 +3580,11 @@ def find_round_for(ss, service, year, month):
 
 
 def create_preference_round(ss, service, year, month, deadline_dt, chat_id):
-    round_id = f"{service.replace(' ', '')}_{year}{month:02d}_{dt.datetime.now(CHURCH_TZ).strftime('%H%M%S')}"
+    # Telegram deep-link payloads only allow letters, digits, "_" and "-", so
+    # strip everything else from the service name (custom services may have
+    # spaces or punctuation).
+    safe_service = re.sub(r"[^A-Za-z0-9]", "", service) or "svc"
+    round_id = f"{safe_service}_{year}{month:02d}_{dt.datetime.now(CHURCH_TZ).strftime('%H%M%S')}"
     ws = ss.worksheet("PreferenceRounds")
     ws.append_rows([[round_id, service, year, month, deadline_dt.isoformat(), "open", chat_id]])
     return round_id
@@ -4253,6 +4296,21 @@ async def menu_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Global error handler: reply to the user instead of failing silently ---
+# python-telegram-bot logs "No error handlers are registered" and swallows
+# any unhandled exception otherwise — the person who triggered it never
+# hears back at all. Registered at the end of build_app().
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logging.getLogger(__name__).error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong on my end — please try that again in a moment."
+            )
+        except Exception:
+            pass
+
+
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -4525,19 +4583,8 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(cancel_role_conv)
-# --- Global error handler: reply to the user instead of failing silently ---
-# python-telegram-bot logs "No error handlers are registered" and swallows
-# any unhandled exception otherwise — the person who triggered it never
-# hears back at all. This registers one in build_app() below.
-async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    logging.getLogger(__name__).error("Unhandled exception", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "Something went wrong on my end — please try that again in a moment."
-            )
-        except Exception:
-            pass
+
+    app.add_error_handler(error_handler)
     return app
 
 
