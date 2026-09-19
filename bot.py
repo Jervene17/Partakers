@@ -1,23 +1,3 @@
-"""
-Service Partaker Scheduling Bot — Phase 1
-==========================================
-Scope of this phase:
-  1. Google Sheet schema setup (Roster + Sunday + Wednesday tabs, plus
-     placeholder tabs for later phases so the schema is stable going forward)
-  2. Equal-share random schedule generator for Sunday & Wednesday services
-  3. Telegram bot skeleton (ConversationHandler) wired to the generator for
-     the "Generate Schedule" menu option, scoped to Sunday/Wednesday only
-
-Stack matches your other bots: python-telegram-bot (async, ConversationHandler)
-+ gspread + Google Sheets, deployable on Railway.
-
-Requires: pip install "python-telegram-bot[job-queue]" gspread google-auth
-(the [job-queue] extra pulls in APScheduler, needed for the #4 reminder jobs).
-
-NOT built yet (later phases): Predawn, Sun Stop Sundays, Filipino Translation
-generation; pull-schedule; reminders; adjustments; roster management; bulk upload.
-"""
-
 import os
 import json
 import random
