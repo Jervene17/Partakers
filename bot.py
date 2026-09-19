@@ -22,6 +22,7 @@ import os
 import json
 import random
 import calendar
+import html
 import datetime as dt
 from collections import defaultdict
 from zoneinfo import ZoneInfo
@@ -170,6 +171,7 @@ SHEET_TABS = [
     "ServiceConfig",
     "PreferenceRounds",
     "PredawnPattern",
+    "Unavailability",
 ]
 
 TAB_HEADERS = {
@@ -191,6 +193,10 @@ TAB_HEADERS = {
     # Recurring weekly Predawn Preacher pattern: which Preacher covers which
     # weekday (0=Monday..5=Saturday), reused every month until changed.
     "PredawnPattern": ["Weekday", "Preacher"],
+    # Dates a partaker said they can NOT do, collected in preference rounds.
+    # One row per (service, date, partaker). Generation avoids these people on
+    # those dates, and /cancel_role only offers replacements who aren't listed.
+    "Unavailability": ["Service", "Date", "Partaker"],
 }
 
 DASHBOARD_MONTHS_AHEAD = 3  # how many upcoming months each dashboard tab shows
@@ -516,7 +522,8 @@ def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude
 
 
 def generate_schedule(service_type, year_month_list, counts, preacher_assignments,
-                       filipino_preacher_assignments=None, roles=None, already_filled=None):
+                       filipino_preacher_assignments=None, roles=None, already_filled=None,
+                       unavailable=None):
     """
     service_type: "Sunday" or "Wednesday"
     year_month_list: list of (year, month) tuples to generate for, in order.
@@ -548,8 +555,13 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                       already applied when the slot was claimed — generation
                       must NOT increment counts for them again here.
 
+    unavailable: {date_str: set(names)} — people who marked that date as one
+                      they can't do. Hard-excluded from every role that date
+                      (only ignored if that would leave a role with nobody).
+
     Returns: (list of (date_str, role, partaker), updated counts dict)
     """
+    unavailable = unavailable or {}
     roles = roles if roles is not None else ROLE_SETS[service_type]
     weekday = SERVICE_WEEKDAY[service_type]
     filipino_preacher_assignments = filipino_preacher_assignments or {}
@@ -574,7 +586,8 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                 if (date_str, role) in already_filled:
                     schedule_rows.append((date_str, role, already_filled[(date_str, role)]))
                     continue
-                hard_exclude = {fil_preacher} if (role == "Presider" and fil_preacher) else set()
+                hard_exclude = ({fil_preacher} if (role == "Presider" and fil_preacher) else set()) \
+                    | set(unavailable.get(date_str, ()))
                 soft_exclude = {fil_preacher} if (fil_preacher and role != "Presider") else set()
                 person = pick_partaker(eligible, counts, taken_today, hard_exclude, soft_exclude)
                 taken_today.add(person)
@@ -616,15 +629,18 @@ def generate_predawn_schedule(dates, counts, preacher_assignments, roles=None, a
     return rows, counts
 
 
-def generate_simple_schedule(dates, roles, counts, already_filled=None):
+def generate_simple_schedule(dates, roles, counts, already_filled=None, unavailable=None):
     """Generic equal-share generator for services with no manual-preacher
     precondition and no cross-role exclusions beyond "not more than 1 role
     per date" — used for Predawn's non-Preacher roles, Sun Stop Sundays
     (roles are department pools, plus an individual Onsite Tech pool), and
     any custom service.
     `already_filled`: see generate_schedule — same skip/exclude/no-recount
-    behavior, for slots claimed in a preference round. Returns (rows, counts)."""
+    behavior, for slots claimed in a preference round. `unavailable` is
+    {date_str: set(names)} — hard-excluded that date, like generate_schedule.
+    Returns (rows, counts)."""
     already_filled = already_filled or {}
+    unavailable = unavailable or {}
     rows = []
     for d in dates:
         date_str = d.isoformat()
@@ -636,11 +652,30 @@ def generate_simple_schedule(dates, roles, counts, already_filled=None):
             if (date_str, role) in already_filled:
                 rows.append((date_str, role, already_filled[(date_str, role)]))
                 continue
-            person = pick_partaker(eligible, counts, taken_today)
+            person = pick_partaker(eligible, counts, taken_today, hard_exclude=set(unavailable.get(date_str, ())))
             taken_today.add(person)
             counts[person] += 1
             rows.append((date_str, role, person))
     return rows, counts
+
+
+async def warn_if_unavailable_scheduled(message, rows, unavailable):
+    """Tells the admin when someone ended up on a date they marked as
+    unavailable (only happens if nobody else eligible was free, or the slot
+    was already filled before generation)."""
+    clashes = [
+        (d, role, person) for d, role, person in rows
+        if role != "Preacher" and person in unavailable.get(d, ())
+    ]
+    if not clashes:
+        return
+    lines = "\n".join(
+        f"- {dt.date.fromisoformat(d).strftime('%b %d')}: {role} — {person}" for d, role, person in clashes
+    )
+    await message.reply_text(
+        "⚠️ Heads up — these people are scheduled on a date they marked as unavailable "
+        "(no other eligible partaker was free, or the slot was already filled):\n" + lines
+    )
 
 
 def format_schedule_summary(service_type, schedule_rows):
@@ -810,11 +845,29 @@ async def preacher_confirm_conflict(update: Update, context: ContextTypes.DEFAUL
     return await preacher_ask_next_date(query, context)
 
 
+GENERATE_BUILTIN_SERVICES = ("Sunday", "Wednesday", "Predawn", "SunStopSundays", "FilipinoTranslation")
+PREDAWN_PATTERN_BUTTON = "__predawn_pattern__"
+
+
 async def generate_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Sunday", callback_data="Sunday")],
         [InlineKeyboardButton("Wednesday", callback_data="Wednesday")],
+        [InlineKeyboardButton("Predawn", callback_data="Predawn")],
+        [InlineKeyboardButton("Sun Stop Sundays", callback_data="SunStopSundays")],
+        [InlineKeyboardButton("Filipino Translation", callback_data="FilipinoTranslation")],
     ]
+    # Custom services added with /add_service that have randomized roles.
+    # If the sheet can't be read, the built-in buttons above still work.
+    try:
+        for service, cfg in load_service_configs(setup_sheet()).items():
+            if service in GENERATE_BUILTIN_SERVICES:
+                continue
+            if any(r["mode"] == "random" for r in cfg["roles"].values()):
+                keyboard.append([InlineKeyboardButton(service, callback_data=service)])
+    except Exception:
+        pass
+    keyboard.append([InlineKeyboardButton("Set Predawn pattern", callback_data=PREDAWN_PATTERN_BUTTON)])
     await update.message.reply_text(
         "Which service would you like to generate a schedule for?",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -825,6 +878,26 @@ async def generate_schedule_start(update: Update, context: ContextTypes.DEFAULT_
 async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.data == "Predawn":
+        ss = setup_sheet()
+        context.user_data["pdp_ss"] = ss
+        if not get_predawn_pattern(ss):
+            await query.edit_message_text("No Predawn weekly pattern set yet — run /set_predawn_pattern first.")
+            return ConversationHandler.END
+        return await predawn_ask_month(update, context)
+    if query.data == "SunStopSundays":
+        await query.edit_message_text("Sun Stop Sundays — pick a month:", reply_markup=month_keyboard())
+        return SELECT_SUNSTOP_MONTH
+    if query.data == PREDAWN_PATTERN_BUTTON:
+        context.user_data["pdp_ss"] = setup_sheet()
+        context.user_data["pdp_weekday_idx"] = 0
+        return await predawn_pattern_ask_day(update, context)
+    if query.data not in ("Sunday", "Wednesday"):
+        # Filipino Translation or a custom service: same flow as /generate_service
+        ss = setup_sheet()
+        context.user_data["gen_svc_ss"] = ss
+        context.user_data["gen_svc_configs"] = load_service_configs(ss)
+        return await generate_service_select(update, context)
     context.user_data["service_type"] = query.data
     await query.edit_message_text(
         f"{query.data} service selected. Pick a month to generate:",
@@ -877,10 +950,14 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # it's already handled by preacher_assignments above.
     already_filled = get_already_filled(ss, dates, exclude_roles=("Preacher",))
 
+    # Dates partakers marked as unavailable in the preference round
+    unavailable = get_unavailability(ss, service_type, dates)
+
     counts = load_assignment_counts(ss)
     schedule_rows, counts = generate_schedule(
         service_type, [(year, month)], counts, preacher_assignments, filipino_preacher_assignments,
         roles=get_random_roles_for_service(ss, service_type), already_filled=already_filled,
+        unavailable=unavailable,
     )
 
     append_schedule_rows(ss, service_type, schedule_rows, skip_preacher_rows=True, skip_keys=already_filled)
@@ -888,6 +965,7 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     summary = format_schedule_summary(service_type, schedule_rows)
     await query.message.reply_text(summary, parse_mode="Markdown")
+    await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
     return ConversationHandler.END
 
 
@@ -1594,13 +1672,17 @@ async def generate_service_period(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text("Generating schedule...")
     already_filled = get_already_filled(ss, dates)
     counts = load_assignment_counts(ss)
-    schedule_rows, counts = generate_simple_schedule(dates, random_roles, counts, already_filled=already_filled)
+    unavailable = get_unavailability(ss, service, dates)
+    schedule_rows, counts = generate_simple_schedule(
+        dates, random_roles, counts, already_filled=already_filled, unavailable=unavailable
+    )
     append_schedule_rows(ss, service, schedule_rows, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
     summary = format_schedule_summary(service, schedule_rows)
     note = f"\n\n(Manual-entry roles for this service — log via /log_role: {', '.join(manual_roles)})" if manual_roles else ""
     await query.message.reply_text(summary + note, parse_mode="Markdown")
+    await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
     return ConversationHandler.END
 
 
@@ -2458,11 +2540,11 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
     return SUB_NEW
 
 
-async def do_substitute(query, context, ss, service, role, date_str, new_partaker):
+async def do_substitute(query, context, ss, service, role, date_str, new_partaker, adj_type="substitution"):
     ws = ss.worksheet(service)
     row_num, old_partaker = get_role_row(ws, role, date_str)
     ws.update_cell(row_num, 3, new_partaker)
-    log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, "substitution")
+    log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, adj_type)
 
     random_roles = get_random_roles_for_service(ss, service)
     if role in random_roles and new_partaker != LIVE_BROADCAST:
@@ -2472,7 +2554,10 @@ async def do_substitute(query, context, ss, service, role, date_str, new_partake
         counts[new_partaker] += 1
         save_assignment_counts(ss, counts)
 
-    text = f"{service} {role} on {date_str}: {old_partaker} -> {new_partaker}"
+    if adj_type == "cancellation":
+        text = f"{service} {role} on {date_str}: {old_partaker} cancelled — {new_partaker} will cover."
+    else:
+        text = f"{service} {role} on {date_str}: {old_partaker} -> {new_partaker}"
     await query.edit_message_text(text)
     await announce_update(context, ss, text)
 
@@ -2515,6 +2600,153 @@ async def substitute_confirm_conflict(update: Update, context: ContextTypes.DEFA
     date_str = context.user_data["sub_date"]
     new_partaker = context.user_data.pop("sub_new_partaker")
     await do_substitute(query, context, ss, service, role, date_str, new_partaker)
+    return ConversationHandler.END
+
+
+# --- /cancel_role: a partaker drops a role on one date; the bot lists who can cover ---
+# Replacement candidates are people eligible for that role who did NOT mark the
+# date as unavailable and aren't already scheduled that day. Nothing changes
+# until the partaker taps a name and confirms — they're expected to ask that
+# person first.
+
+CANCEL_SERVICE, CANCEL_NAME, CANCEL_PICK, CANCEL_REPLACEMENT, CANCEL_CONFIRM = range(180, 185)
+
+
+def upcoming_assignments(ws, name=None):
+    """[(date_str, role, partaker)] from today on, earliest first. Optionally
+    only for one person. Live Broadcast rows are skipped."""
+    today = dt.datetime.now(CHURCH_TZ).date().isoformat()
+    out = []
+    for r in ws.get_all_records():
+        date_str, person = str(r.get("Date", "")), r.get("Partaker")
+        if len(date_str) == 10 and date_str >= today and person and person != LIVE_BROADCAST:
+            if name is None or person == name:
+                out.append((date_str, r["Role"], person))
+    return sorted(out)
+
+
+def available_replacements(ss, service, date_str, role, current):
+    """People who could take `role` on `date_str`: in the role's pool, not the
+    person cancelling, not marked unavailable, and not already scheduled
+    that day (this service, plus the Sunday <-> Filipino Translation link)."""
+    pool = get_role_pool(ss, service, role)
+    unavailable = get_unavailability(ss, service, [date_str]).get(date_str, set())
+    busy = {
+        r["Partaker"] for r in ss.worksheet(service).get_all_records()
+        if r.get("Date") == date_str and r.get("Role") != role
+    }
+    other = {"Sunday": "FilipinoTranslation", "FilipinoTranslation": "Sunday"}.get(service)
+    if other:
+        busy |= {r["Partaker"] for r in ss.worksheet(other).get_all_records() if r.get("Date") == date_str}
+    return [
+        p for p in pool
+        if p not in (current, LIVE_BROADCAST) and p not in unavailable and p not in busy
+    ]
+
+
+async def cancel_role_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ss = setup_sheet()
+    context.user_data["cr_ss"] = ss
+    buttons = [[InlineKeyboardButton(s, callback_data=s)] for s in get_all_schedule_tabs(ss)]
+    await update.message.reply_text("Cancel a role — which service?", reply_markup=InlineKeyboardMarkup(buttons))
+    return CANCEL_SERVICE
+
+
+async def cancel_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ss = context.user_data["cr_ss"]
+    service = query.data
+    context.user_data["cr_service"] = service
+    names = sorted({p for _, _, p in upcoming_assignments(ss.worksheet(service))})
+    if not names:
+        await query.edit_message_text(f"No upcoming {service} assignments found.")
+        return ConversationHandler.END
+    buttons = [[InlineKeyboardButton(n, callback_data=n)] for n in names]
+    await query.edit_message_text(f"{service} — which name is yours?", reply_markup=InlineKeyboardMarkup(buttons))
+    return CANCEL_NAME
+
+
+async def cancel_select_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ss, service = context.user_data["cr_ss"], context.user_data["cr_service"]
+    name = query.data
+    context.user_data["cr_name"] = name
+    entries = upcoming_assignments(ss.worksheet(service), name)
+    if not entries:
+        await query.edit_message_text(f"{name} has no upcoming {service} roles.")
+        return ConversationHandler.END
+    context.user_data["cr_entries"] = entries
+    buttons = [
+        [InlineKeyboardButton(f"{dt.date.fromisoformat(d).strftime('%a %b %d')} — {role}", callback_data=str(i))]
+        for i, (d, role, _) in enumerate(entries)
+    ]
+    await query.edit_message_text(
+        f"{name}, which role do you want to cancel?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return CANCEL_PICK
+
+
+async def cancel_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ss, service = context.user_data["cr_ss"], context.user_data["cr_service"]
+    name = context.user_data["cr_name"]
+    date_str, role, _ = context.user_data["cr_entries"][int(query.data)]
+    context.user_data["cr_date"], context.user_data["cr_role"] = date_str, role
+
+    candidates = available_replacements(ss, service, date_str, role, name)
+    pretty = dt.date.fromisoformat(date_str).strftime("%A, %B %d")
+    if not candidates:
+        await query.edit_message_text(
+            f"Nobody else is available for {role} on {pretty} based on the submitted preferences "
+            f"and who's already scheduled that day.\nPlease talk to the admin — they can pick anyone with /substitute."
+        )
+        return ConversationHandler.END
+
+    buttons = [[InlineKeyboardButton(p, callback_data=p)] for p in candidates]
+    buttons.append([InlineKeyboardButton("Never mind, keep my role", callback_data="nevermind")])
+    await query.edit_message_text(
+        f"{name} is cancelling {role} on {pretty}.\n\n"
+        f"Available partakers (based on preferences):\n"
+        f"Please ask one of them first, then tap their name to confirm.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CANCEL_REPLACEMENT
+
+
+async def cancel_pick_replacement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "nevermind":
+        await query.edit_message_text("OK — nothing changed.")
+        return ConversationHandler.END
+    context.user_data["cr_new"] = query.data
+    name, role = context.user_data["cr_name"], context.user_data["cr_role"]
+    date_str = context.user_data["cr_date"]
+    buttons = [
+        [InlineKeyboardButton("Confirm", callback_data="yes")],
+        [InlineKeyboardButton("Cancel", callback_data="no")],
+    ]
+    await query.edit_message_text(
+        f"Confirm: {query.data} takes over {role} on {date_str} from {name}?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CANCEL_CONFIRM
+
+
+async def cancel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data != "yes":
+        await query.edit_message_text("OK — nothing changed.")
+        return ConversationHandler.END
+    ss, service = context.user_data["cr_ss"], context.user_data["cr_service"]
+    await do_substitute(
+        query, context, ss, service, context.user_data["cr_role"], context.user_data["cr_date"],
+        context.user_data["cr_new"], adj_type="cancellation",
+    )
     return ConversationHandler.END
 
 
@@ -3383,8 +3615,9 @@ async def do_close_round(context, round_id):
         if fil_chat_id:
             ws = ss.worksheet("FilipinoTranslation")
             rows = rows_in_month(ws.get_all_records(), year, month)
-            summary = format_schedule_summary(f"Filipino Translation — {month_label}", records_to_rows(rows))
-            await context.bot.send_message(chat_id=fil_chat_id, text=summary, parse_mode="Markdown")
+            if rows:  # nothing to show until the month has actually been generated
+                summary = format_schedule_summary(f"Filipino Translation — {month_label}", records_to_rows(rows))
+                await context.bot.send_message(chat_id=fil_chat_id, text=summary, parse_mode="Markdown")
 
         partaker_chat_id = get_group_chat_id(ss, "Service Partakers")
         if partaker_chat_id:
@@ -3398,12 +3631,13 @@ async def do_close_round(context, round_id):
     chat_id = round_.get("GroupChatID") or get_group_chat_id(ss, "Service Partakers")
     if chat_id:
         text = (
-            f"⏰ Preference collection for *{service} — {month_label}* has closed.\n\n"
-            f"You can now run /generate for that period — anyone who already claimed a slot keeps it, "
-            f"and everyone else will be assigned automatically.\n\n"
-            f"Any special adjustments or requests should be sent to the admin directly."
+            f"⏰ Preference collection for {service} — {month_label} has closed.\n\n"
+            f"The schedule can now be generated — nobody will be assigned on a date they marked as "
+            f"not available.\n\n"
+            f"For changes after this point, use /cancel_role, /swap, /substitute or /special_request "
+            f"(please ask someone first, and submit changes in advance)."
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def close_preference_round_job(context: ContextTypes.DEFAULT_TYPE):
@@ -3442,10 +3676,9 @@ OPEN_PREF_SERVICE, OPEN_PREF_MONTH, OPEN_PREF_DEADLINE, OPEN_PREF_CUSTOM_TEXT = 
 async def open_preferences_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss = setup_sheet()
     context.user_data["pref_ss"] = ss
-    # Sun Stop Sundays never uses preference rounds — generate directly, adjust after.
-    # Predawn now uses the /set_predawn_pattern + /generate_predawn flow instead
-    # (it has no randomized roles left to collect preferences for).
-    tabs = [s for s in get_all_schedule_tabs(ss) if s not in ("SunStopSundays", "Predawn")]
+    # Every service can collect unavailable dates except Sun Stop Sundays,
+    # which is generated directly and adjusted afterwards.
+    tabs = [s for s in get_all_schedule_tabs(ss) if s != "SunStopSundays"]
     buttons = [[InlineKeyboardButton(s, callback_data=s)] for s in tabs]
     await update.message.reply_text(
         "Open a preference round for which service?", reply_markup=InlineKeyboardMarkup(buttons)
@@ -3471,8 +3704,10 @@ async def open_pref_select_month(update: Update, context: ContextTypes.DEFAULT_T
 
     # Gate 1: Preacher must already be set for this service+month (Sunday's
     # Preacher gates FilipinoTranslation too, since translation serves Sunday).
+    # Predawn skips this gate: its Preacher comes from the weekly pattern and
+    # it has no randomized roles that depend on preferences.
     preacher_service = "Sunday" if service == "FilipinoTranslation" else service
-    if not is_preacher_fully_set(ss, preacher_service, year, month):
+    if service != "Predawn" and not is_preacher_fully_set(ss, preacher_service, year, month):
         await query.edit_message_text(
             f"Can't open preferences yet — {preacher_service} has no Preacher scheduled for "
             f"{month_label}. Run /set_preacher first."
@@ -3512,15 +3747,16 @@ async def open_pref_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, d
     round_id = create_preference_round(ss, service, year, month, deadline, chat_id)
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     deep_link = f"https://t.me/{BOT_USERNAME}?start=pref_{round_id}"
+    # HTML (not Markdown) so the underscores in /cancel_role etc. are safe
     announcement = (
-        f"📋 Preference collection is open for *{service} — {month_label}*!\n\n"
-        f"Tap below to claim the dates/roles you're okay with — first come, first served. "
-        f"If you don't respond by *{deadline.strftime('%B %d, %Y %I:%M %p')}*, that means you're okay "
-        f"being assigned wherever needed.\n\n"
-        f"[Set my preferences]({deep_link})"
+        f"📋 <b>Preference collection is open for {html.escape(service)} — {month_label}!</b>\n\n"
+        f"{html.escape(PARTAKER_PREFERENCE_NOTE)}\n{html.escape(PARTAKER_COMMANDS_HINT)}\n\n"
+        f"Deadline: <b>{deadline.strftime('%B %d, %Y %I:%M %p')}</b>. If you don't respond by then, "
+        f"you're treated as available on every date.\n\n"
+        f'<a href="{html.escape(deep_link, quote=True)}">Set my preferences</a>'
     )
     await context.bot.send_message(
-        chat_id=chat_id, text=announcement, parse_mode="Markdown", disable_web_page_preview=True
+        chat_id=chat_id, text=announcement, parse_mode="HTML", disable_web_page_preview=True
     )
     context.job_queue.run_once(
         close_preference_round_job, when=deadline, data={"round_id": round_id}, name=f"close_{round_id}"
@@ -3582,16 +3818,66 @@ async def close_preferences_select(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
-# --- /start with a deep-link payload: partaker claims slots ---
+# --- /start with a deep-link payload: partaker marks the dates they can NOT do ---
+# Preferences are "unavailable dates", not slot claims: everyone starts out
+# available, taps the dates they can't make, and generation (plus
+# /cancel_role's replacement list) then avoids them on those dates.
 
 PREF_SELECT_NAME, PREF_SELECT_DATE, PREF_SELECT_ROLE, PREF_CONFIRM_CONFLICT = range(120, 124)
+# (PREF_SELECT_ROLE / PREF_CONFIRM_CONFLICT are no longer used; the numbers
+# stay reserved so nothing else gets renumbered.)
+
+PARTAKER_PREFERENCE_NOTE = (
+    "Please select the dates you are not available to be a partaker. "
+    "No need for preachers to set their preferences as they are automatically waived for other partaker roles. "
+    "For schedule swaps and substitutions, you can submit them later via 'cancel', 'swap', 'substitutions' "
+    "and 'special request'. Please make sure to ask someone for swaps and substitutions. "
+    "Please submit any changes in advance."
+)
+PARTAKER_COMMANDS_HINT = "(Commands: /cancel_role, /swap, /substitute, /special_request)"
+
+
+def get_unavailability(ss, service, dates):
+    """{date_str: set(names)} of partakers who marked themselves unavailable
+    for any of these dates (date objects or ISO strings) in this service."""
+    date_strs = {d if isinstance(d, str) else d.isoformat() for d in dates}
+    out = defaultdict(set)
+    for r in ss.worksheet("Unavailability").get_all_records():
+        if r.get("Service") == service and r.get("Date") in date_strs:
+            out[r["Date"]].add(r["Partaker"])
+    return out
+
+
+def toggle_unavailable(ss, service, date_str, name):
+    """Flips one (service, date, name) row. Returns True if the person is now
+    marked unavailable, False if the mark was just removed."""
+    ws = ss.worksheet("Unavailability")
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        if row[:3] == [service, date_str, name]:
+            ws.delete_rows(i)
+            return False
+    ws.append_rows([[service, date_str, name]])
+    return True
+
+
+def get_round_partaker_names(ss, round_):
+    """Names worth showing in a round: anyone eligible for at least one
+    non-Preacher role of that service (Preachers are waived). Falls back to
+    the whole roster if the service has no eligible names on file."""
+    service = round_["Service"]
+    names = set()
+    for role in get_round_roles(ss, round_):
+        if role != "Preacher":
+            names.update(get_role_pool(ss, service, role))
+    names.discard(LIVE_BROADCAST)
+    return sorted(names) or get_roster_names(ss)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args or not args[0].startswith("pref_"):
         await update.message.reply_text(
-            "Hi! I'm the service scheduling bot. Admins can use /generate, /roster, and the rest — "
+            "Hi! I'm the service scheduling bot. Admins: send /menu for buttons to everything (or use /generate, /roster, and the rest) — "
             "if someone shared a preference link with you, tap that link to set your preferences."
         )
         return ConversationHandler.END
@@ -3605,136 +3891,113 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["pref_round"] = round_
     context.user_data["pref_ss"] = ss
-    names = get_roster_names(ss)
+    names = get_round_partaker_names(ss, round_)
     buttons = [[InlineKeyboardButton(n, callback_data=n)] for n in names]
     month_label = dt.date(int(round_["Year"]), int(round_["Month"]), 1).strftime("%B %Y")
     await update.message.reply_text(
-        f"Setting preferences for {round_['Service']} — {month_label}.\nWhich name is yours?",
+        f"Setting preferences for {round_['Service']} — {month_label}.\n\n"
+        f"{PARTAKER_PREFERENCE_NOTE}\n{PARTAKER_COMMANDS_HINT}\n\n"
+        f"Which name is yours?",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return PREF_SELECT_NAME
 
 
+def pref_round_still_open(context):
+    ss, round_ = context.user_data["pref_ss"], context.user_data["pref_round"]
+    return is_round_open(get_round(ss, round_["RoundID"]))
+
+
 async def pref_select_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data["pref_name"] = query.data
+    ss, round_ = context.user_data["pref_ss"], context.user_data["pref_round"]
+    name = query.data
+    service = round_["Service"]
+
+    if not pref_round_still_open(context):
+        await query.edit_message_text("This preference round has closed — thanks for checking!")
+        return ConversationHandler.END
+
+    dates = get_round_dates(ss, round_)
+    context.user_data["pref_name"] = name
+    context.user_data["pref_dates"] = dates
+    context.user_data["pref_marked"] = {
+        ds for ds, names in get_unavailability(ss, service, dates).items() if name in names
+    }
+    context.user_data["pref_preacher_dates"] = {
+        r["Date"] for r in ss.worksheet(service).get_all_records()
+        if r.get("Role") == "Preacher" and r.get("Partaker") == name
+    }
     return await pref_show_dates(update, context)
 
 
 async def pref_show_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ss = context.user_data["pref_ss"]
-    round_ = context.user_data["pref_round"]
     name = context.user_data["pref_name"]
+    dates = context.user_data["pref_dates"]
+    marked = context.user_data["pref_marked"]
+    preacher_dates = context.user_data["pref_preacher_dates"]
 
-    if not is_round_open(get_round(ss, round_["RoundID"])):
-        text = "This preference round has closed — thanks for checking!"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text)
-        else:
-            await update.message.reply_text(text)
-        return ConversationHandler.END
-
-    dates = get_round_dates(ss, round_)
-    ws = ss.worksheet(round_["Service"])
-    records = ws.get_all_records()
-
-    buttons = []
+    buttons, row = [], []
     for d in dates:
         date_str = d.isoformat()
-        my_role = next((r["Role"] for r in records if r["Date"] == date_str and r["Partaker"] == name), None)
-        if my_role:
-            label = f"{d.strftime('%b %d')} — you have {my_role}"
-        else:
-            open_roles = get_open_roles_for_date(ss, round_, date_str, name)
-            label = f"{d.strftime('%b %d')} ({len(open_roles)} open)" if open_roles else f"{d.strftime('%b %d')} (full)"
-        buttons.append([InlineKeyboardButton(label, callback_data=date_str)])
+        label = d.strftime("%a %b %d")
+        if date_str in preacher_dates:
+            label = f"🎤 {label}"
+        elif date_str in marked:
+            label = f"✖ {label}"
+        row.append(InlineKeyboardButton(label, callback_data=date_str))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
     buttons.append([InlineKeyboardButton("I'm done", callback_data="done")])
 
-    text = f"Hi {name}! Tap a date to see open roles, or 'I'm done' when finished."
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    text = (
+        f"Hi {name}! Tap each date you are NOT available (✖ = not available; tap again to undo). "
+        f"Dates you leave alone count as available. Tap 'I'm done' when finished."
+    )
+    if preacher_dates:
+        text += "\n🎤 = you're the Preacher that day, so you're already waived from other roles."
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     return PREF_SELECT_DATE
 
 
 async def pref_select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    ss, round_ = context.user_data["pref_ss"], context.user_data["pref_round"]
+    name = context.user_data["pref_name"]
+
     if query.data == "done":
+        await query.answer()
+        marked = sorted(context.user_data["pref_marked"])
+        listing = ", ".join(dt.date.fromisoformat(d).strftime("%b %d") for d in marked) if marked else "none"
         await query.edit_message_text(
-            "Thanks — your preferences are saved! You can reopen this link anytime before the "
-            "deadline to change or add more."
+            f"Thanks {name} — your unavailable dates are saved: {listing}.\n"
+            f"You can reopen this link anytime before the deadline to change them."
         )
         return ConversationHandler.END
 
     date_str = query.data
-    context.user_data["pref_date"] = date_str
-    ss, round_, name = context.user_data["pref_ss"], context.user_data["pref_round"], context.user_data["pref_name"]
-    open_roles = get_open_roles_for_date(ss, round_, date_str, name)
-
-    if not open_roles:
-        await query.answer("No open roles for you on that date.", show_alert=True)
-        return await pref_show_dates(update, context)
-
-    buttons = [[InlineKeyboardButton(r, callback_data=r)] for r in open_roles]
-    buttons.append([InlineKeyboardButton("« Back", callback_data="back")])
-    await query.edit_message_text(f"{date_str} — which role?", reply_markup=InlineKeyboardMarkup(buttons))
-    return PREF_SELECT_ROLE
-
-
-async def pref_select_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "back":
-        return await pref_show_dates(update, context)
-
-    role = query.data
-    ss, round_, name = context.user_data["pref_ss"], context.user_data["pref_round"], context.user_data["pref_name"]
-    date_str = context.user_data["pref_date"]
-
-    if not is_round_open(get_round(ss, round_["RoundID"])):
-        await query.edit_message_text("This preference round just closed — sorry!")
-        return ConversationHandler.END
-
-    conflicts = find_conflicts(ss, round_["Service"], date_str, name)
-    if conflicts:
-        context.user_data["pref_pending_role"] = role
-        buttons = [
-            [InlineKeyboardButton("Yes, reserve it too", callback_data="yes")],
-            [InlineKeyboardButton("No, never mind", callback_data="no")],
-        ]
-        await query.edit_message_text(
-            conflict_warning_text(name, date_str, conflicts, role), reply_markup=InlineKeyboardMarkup(buttons)
+    if date_str in context.user_data["pref_preacher_dates"]:
+        await query.answer(
+            "You're the Preacher that day — you're automatically waived from other roles.", show_alert=True
         )
-        return PREF_CONFIRM_CONFLICT
+        return PREF_SELECT_DATE
 
-    if reserve_slot(ss, round_, date_str, role, name):
-        await query.answer(f"Reserved {role} on {date_str}!", show_alert=True)
-    else:
-        await query.answer("Sorry, someone just took that — pick another.", show_alert=True)
-    return await pref_show_dates(update, context)
-
-
-async def pref_confirm_conflict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data != "yes":
-        return await pref_show_dates(update, context)
-
-    ss, round_, name = context.user_data["pref_ss"], context.user_data["pref_round"], context.user_data["pref_name"]
-    date_str = context.user_data["pref_date"]
-    role = context.user_data.pop("pref_pending_role")
-
-    if not is_round_open(get_round(ss, round_["RoundID"])):
+    if not pref_round_still_open(context):
+        await query.answer()
         await query.edit_message_text("This preference round just closed — sorry!")
         return ConversationHandler.END
 
-    if reserve_slot(ss, round_, date_str, role, name):
-        await query.answer(f"Reserved {role} on {date_str}!", show_alert=True)
+    now_unavailable = toggle_unavailable(ss, round_["Service"], date_str, name)
+    marked = context.user_data["pref_marked"]
+    if now_unavailable:
+        marked.add(date_str)
     else:
-        await query.answer("Sorry, someone just took that — pick another.", show_alert=True)
+        marked.discard(date_str)
+    await query.answer("Marked as not available" if now_unavailable else "Marked as available again")
     return await pref_show_dates(update, context)
 
 
@@ -3865,19 +4128,134 @@ async def mark_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+# ---------------------------------------------------------------------------
+# /menu — one inline keyboard for every admin command
+# ---------------------------------------------------------------------------
+# Each button re-uses the existing command's own flow. A command's start
+# function normally replies through update.message, which doesn't exist on a
+# button tap, so _ButtonAsCommand presents the tapped menu message as
+# update.message — to the start function it looks like the command was typed.
+
+class _ButtonAsCommand:
+    def __init__(self, update):
+        self._update = update
+        self.message = update.callback_query.message
+        self.callback_query = None
+
+    def __getattr__(self, name):
+        return getattr(self._update, name)
+
+
+def from_menu(start_fn):
+    async def _entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)  # retire the tapped menu
+        except Exception:
+            pass
+        return await start_fn(_ButtonAsCommand(update), context)
+    return _entry
+
+
+def menu_entry(key, start_fn):
+    """Extra ConversationHandler entry point: the /menu button for `key`."""
+    return CallbackQueryHandler(from_menu(start_fn), pattern=f"^menu:{key}$")
+
+
+def _menu_btn(label, key):
+    return InlineKeyboardButton(label, callback_data=f"menu:{key}")
+
+
+MENU_TITLE = "Scheduling menu — what would you like to do?"
+
+MAIN_MENU_ROWS = [
+    [_menu_btn("📅 Generate schedule", "generate")],
+    [_menu_btn("🎤 Set preacher", "set_preacher"), _menu_btn("🌄 Set Predawn pattern", "set_predawn_pattern")],
+    [_menu_btn("🎛 Log tech", "log_tech"), _menu_btn("📝 Log a role", "log_role")],
+    [_menu_btn("🔄 Adjustments ›", "adjust")],
+    [_menu_btn("🔎 Pull schedule", "pull_schedule"), _menu_btn("👤 Pull person", "pull_person")],
+    [_menu_btn("➕ Add service", "add_service"), _menu_btn("➕ Add role", "add_role")],
+    [_menu_btn("👥 Roster", "roster"), _menu_btn("🗳 Preferences ›", "prefs")],
+    [_menu_btn("📤 Bulk upload (template)", "template")],
+    [_menu_btn("🗓 Yearly renewal", "renew_year")],
+    [_menu_btn("⚙️ More ›", "more")],
+]
+
+SUBMENUS = {
+    "adjust": ("Adjustments — what would you like to do?", [
+        [_menu_btn("Cancel a role", "cancel_role")],
+        [_menu_btn("Swap dates", "swap")],
+        [_menu_btn("Substitute a partaker", "substitute")],
+        [_menu_btn("Special request", "special_request")],
+        [_menu_btn("Mark live broadcast", "mark_broadcast")],
+    ]),
+    "prefs": ("Preferences — what would you like to do?", [
+        [_menu_btn("Open a preference round", "open_preferences")],
+        [_menu_btn("Close a round early", "close_preferences")],
+    ]),
+    "more": ("More — what would you like to do?", [
+        [_menu_btn("Refresh dashboards", "refresh_dashboard")],
+        [_menu_btn("Sync dashboards", "sync_dashboard")],
+        [_menu_btn("Register this group for reminders", "set_group_chat")],
+    ]),
+}
+
+
+def _end_all_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Drop whatever command the user was in the middle of, so a menu tap
+    always starts fresh instead of being read as an answer to the old step."""
+    for handlers in context.application.handlers.values():
+        for handler in handlers:
+            if isinstance(handler, ConversationHandler):
+                try:
+                    handler._update_state(ConversationHandler.END, handler._get_key(update))
+                except Exception:
+                    pass  # unfamiliar library internals: skip, the menu still works
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _end_all_conversations(update, context)
+    await update.message.reply_text(MENU_TITLE, reply_markup=InlineKeyboardMarkup(MAIN_MENU_ROWS))
+
+
+async def menu_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    if key == "main":
+        await query.edit_message_text(MENU_TITLE, reply_markup=InlineKeyboardMarkup(MAIN_MENU_ROWS))
+        return
+    title, rows = SUBMENUS[key]
+    await query.edit_message_text(
+        title, reply_markup=InlineKeyboardMarkup(rows + [[_menu_btn("‹ Back", "main")]])
+    )
+
+
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # /menu and its navigation come first so they always win over an open command
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CallbackQueryHandler(menu_nav, pattern=r"^menu:(main|adjust|prefs|more)$"))
+    app.add_handler(CallbackQueryHandler(from_menu(refresh_dashboard_command), pattern=r"^menu:refresh_dashboard$"))
+    app.add_handler(CallbackQueryHandler(from_menu(sync_dashboard_command), pattern=r"^menu:sync_dashboard$"))
+
     generate_conv = ConversationHandler(
-        entry_points=[CommandHandler("generate", generate_schedule_start)],
+        entry_points=[CommandHandler("generate", generate_schedule_start), menu_entry("generate", generate_schedule_start)],
         states={
             SELECT_SERVICE: [CallbackQueryHandler(select_service)],
             SELECT_MONTH: [CallbackQueryHandler(select_month)],
+            PREDAWN_GEN_MONTH: [CallbackQueryHandler(predawn_generate_month)],
+            PREDAWN_ADJUST: [CallbackQueryHandler(predawn_adjust_response)],
+            SELECT_SUNSTOP_MONTH: [CallbackQueryHandler(select_sunstop_month)],
+            PREDAWN_PATTERN_DAY: [CallbackQueryHandler(predawn_pattern_pick_day)],
+            GEN_SVC_SELECT_PERIOD: [CallbackQueryHandler(generate_service_period)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     preacher_conv = ConversationHandler(
-        entry_points=[CommandHandler("set_preacher", set_preacher_start)],
+        entry_points=[CommandHandler("set_preacher", set_preacher_start), menu_entry("set_preacher", set_preacher_start)],
         states={
             PREACHER_SELECT_SERVICE: [CallbackQueryHandler(preacher_select_service)],
             PREACHER_SELECT_MONTH: [CallbackQueryHandler(preacher_select_month)],
@@ -3887,7 +4265,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     predawn_pattern_conv = ConversationHandler(
-        entry_points=[CommandHandler("set_predawn_pattern", set_predawn_pattern_start)],
+        entry_points=[CommandHandler("set_predawn_pattern", set_predawn_pattern_start), menu_entry("set_predawn_pattern", set_predawn_pattern_start)],
         states={
             PREDAWN_PATTERN_DAY: [CallbackQueryHandler(predawn_pattern_pick_day)],
             PREDAWN_GEN_MONTH: [CallbackQueryHandler(predawn_generate_month)],
@@ -3910,7 +4288,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     tech_conv = ConversationHandler(
-        entry_points=[CommandHandler("log_tech", log_tech_start)],
+        entry_points=[CommandHandler("log_tech", log_tech_start), menu_entry("log_tech", log_tech_start)],
         states={
             TECH_SELECT_SERVICE: [CallbackQueryHandler(tech_select_service)],
             TECH_SELECT_ROLE: [CallbackQueryHandler(tech_select_role)],
@@ -3921,7 +4299,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     add_service_conv = ConversationHandler(
-        entry_points=[CommandHandler("add_service", add_service_start)],
+        entry_points=[CommandHandler("add_service", add_service_start), menu_entry("add_service", add_service_start)],
         states={
             ADD_SVC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_service_name)],
             ADD_SVC_CADENCE: [CallbackQueryHandler(add_service_cadence)],
@@ -3936,7 +4314,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     add_role_conv = ConversationHandler(
-        entry_points=[CommandHandler("add_role", add_role_start)],
+        entry_points=[CommandHandler("add_role", add_role_start), menu_entry("add_role", add_role_start)],
         states={
             ADD_ROLE_SELECT_SERVICE: [CallbackQueryHandler(add_role_select_service)],
             ADD_SVC_ROLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_service_role_name)],
@@ -3954,7 +4332,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     log_role_conv = ConversationHandler(
-        entry_points=[CommandHandler("log_role", log_role_start)],
+        entry_points=[CommandHandler("log_role", log_role_start), menu_entry("log_role", log_role_start)],
         states={
             LOG_ROLE_SELECT_SERVICE: [CallbackQueryHandler(log_role_select_service)],
             LOG_ROLE_SELECT_ROLE: [CallbackQueryHandler(log_role_select_role)],
@@ -3965,7 +4343,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     pull_schedule_conv = ConversationHandler(
-        entry_points=[CommandHandler("pull_schedule", pull_schedule_start)],
+        entry_points=[CommandHandler("pull_schedule", pull_schedule_start), menu_entry("pull_schedule", pull_schedule_start)],
         states={
             PULL_SELECT_SERVICE: [CallbackQueryHandler(pull_select_service)],
             PULL_SELECT_PERIOD: [CallbackQueryHandler(pull_select_period)],
@@ -3973,7 +4351,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     pull_person_conv = ConversationHandler(
-        entry_points=[CommandHandler("pull_person", pull_person_start)],
+        entry_points=[CommandHandler("pull_person", pull_person_start), menu_entry("pull_person", pull_person_start)],
         states={
             PULL_PERSON_NAME: [CallbackQueryHandler(pull_person_name)],
             PULL_PERSON_MODE: [CallbackQueryHandler(pull_person_mode)],
@@ -3983,12 +4361,12 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     set_group_chat_conv = ConversationHandler(
-        entry_points=[CommandHandler("set_group_chat", set_group_chat_start)],
+        entry_points=[CommandHandler("set_group_chat", set_group_chat_start), menu_entry("set_group_chat", set_group_chat_start)],
         states={SET_GROUP_PURPOSE: [CallbackQueryHandler(set_group_purpose)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     swap_conv = ConversationHandler(
-        entry_points=[CommandHandler("swap", swap_start)],
+        entry_points=[CommandHandler("swap", swap_start), menu_entry("swap", swap_start)],
         states={
             SWAP_SERVICE: [CallbackQueryHandler(swap_select_service)],
             SWAP_ROLE: [CallbackQueryHandler(swap_select_role)],
@@ -3999,7 +4377,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     substitute_conv = ConversationHandler(
-        entry_points=[CommandHandler("substitute", substitute_start)],
+        entry_points=[CommandHandler("substitute", substitute_start), menu_entry("substitute", substitute_start)],
         states={
             SUB_SERVICE: [CallbackQueryHandler(substitute_select_service)],
             SUB_ROLE: [CallbackQueryHandler(substitute_select_role)],
@@ -4010,7 +4388,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     special_request_conv = ConversationHandler(
-        entry_points=[CommandHandler("special_request", special_request_start)],
+        entry_points=[CommandHandler("special_request", special_request_start), menu_entry("special_request", special_request_start)],
         states={
             SPECIAL_SERVICE: [CallbackQueryHandler(special_select_service)],
             SPECIAL_PERSON: [CallbackQueryHandler(special_select_person)],
@@ -4020,7 +4398,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     roster_conv = ConversationHandler(
-        entry_points=[CommandHandler("roster", roster_start)],
+        entry_points=[CommandHandler("roster", roster_start), menu_entry("roster", roster_start)],
         states={
             ROSTER_MENU: [CallbackQueryHandler(roster_menu)],
             ROSTER_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, roster_add_name)],
@@ -4033,7 +4411,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     template_conv = ConversationHandler(
-        entry_points=[CommandHandler("template", template_start)],
+        entry_points=[CommandHandler("template", template_start), menu_entry("template", template_start)],
         states={
             TEMPLATE_SELECT_SERVICE: [CallbackQueryHandler(template_select_service)],
             TEMPLATE_SELECT_PERIOD: [CallbackQueryHandler(template_select_period)],
@@ -4061,7 +4439,7 @@ def build_app():
     app.add_handler(CommandHandler("refresh_dashboard", refresh_dashboard_command))
     app.add_handler(CommandHandler("sync_dashboard", sync_dashboard_command))
     renew_year_conv = ConversationHandler(
-        entry_points=[CommandHandler("renew_year", renew_year_start)],
+        entry_points=[CommandHandler("renew_year", renew_year_start), menu_entry("renew_year", renew_year_start)],
         states={RENEW_CONFIRM: [CallbackQueryHandler(renew_year_confirm)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -4075,7 +4453,7 @@ def build_app():
     app.job_queue.run_daily(send_friday_reminder, time=dt.time(hour=20, minute=0, tzinfo=CHURCH_TZ))
 
     open_preferences_conv = ConversationHandler(
-        entry_points=[CommandHandler("open_preferences", open_preferences_start)],
+        entry_points=[CommandHandler("open_preferences", open_preferences_start), menu_entry("open_preferences", open_preferences_start)],
         states={
             OPEN_PREF_SERVICE: [CallbackQueryHandler(open_pref_select_service)],
             OPEN_PREF_MONTH: [CallbackQueryHandler(open_pref_select_month)],
@@ -4089,15 +4467,13 @@ def build_app():
         states={
             PREF_SELECT_NAME: [CallbackQueryHandler(pref_select_name)],
             PREF_SELECT_DATE: [CallbackQueryHandler(pref_select_date)],
-            PREF_SELECT_ROLE: [CallbackQueryHandler(pref_select_role)],
-            PREF_CONFIRM_CONFLICT: [CallbackQueryHandler(pref_confirm_conflict)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(open_preferences_conv)
     app.add_handler(claim_preferences_conv)
     close_preferences_conv = ConversationHandler(
-        entry_points=[CommandHandler("close_preferences", close_preferences_start)],
+        entry_points=[CommandHandler("close_preferences", close_preferences_start), menu_entry("close_preferences", close_preferences_start)],
         states={CLOSE_PREF_SELECT: [CallbackQueryHandler(close_preferences_select)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -4105,7 +4481,7 @@ def build_app():
     app.job_queue.run_once(startup_recover_rounds, when=5)
 
     mark_broadcast_conv = ConversationHandler(
-        entry_points=[CommandHandler("mark_broadcast", mark_broadcast_start)],
+        entry_points=[CommandHandler("mark_broadcast", mark_broadcast_start), menu_entry("mark_broadcast", mark_broadcast_start)],
         states={
             MARK_BC_SERVICE: [CallbackQueryHandler(mark_broadcast_select_service)],
             MARK_BC_MONTH: [CallbackQueryHandler(mark_broadcast_select_month)],
@@ -4115,6 +4491,19 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(mark_broadcast_conv)
+
+    cancel_role_conv = ConversationHandler(
+        entry_points=[CommandHandler("cancel_role", cancel_role_start), menu_entry("cancel_role", cancel_role_start)],
+        states={
+            CANCEL_SERVICE: [CallbackQueryHandler(cancel_select_service)],
+            CANCEL_NAME: [CallbackQueryHandler(cancel_select_name)],
+            CANCEL_PICK: [CallbackQueryHandler(cancel_pick_entry)],
+            CANCEL_REPLACEMENT: [CallbackQueryHandler(cancel_pick_replacement)],
+            CANCEL_CONFIRM: [CallbackQueryHandler(cancel_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(cancel_role_conv)
 
     return app
 
