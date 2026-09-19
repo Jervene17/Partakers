@@ -928,7 +928,7 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Slots already claimed via a preference round (or any manual write)
     # get skipped rather than re-picked. "Preacher" is excluded here since
     # it's already handled by preacher_assignments above.
-    already_filled = get_already_filled(ss, dates, exclude_roles=("Preacher",))
+    already_filled = get_already_filled(ss.worksheet(service_type), dates, exclude_roles=("Preacher",))
 
     # Dates partakers marked as unavailable in the preference round
     unavailable = get_unavailability(ss, service_type, dates)
@@ -1137,7 +1137,7 @@ async def select_sunstop_month(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text("Generating Sun Stop Sundays schedule...")
 
     ss = setup_sheet()
-    already_filled = get_already_filled(ss, dates)
+    already_filled = get_already_filled(ss.worksheet("SunStopSundays"), dates)
     counts = load_assignment_counts(ss)
     schedule_rows, counts = generate_simple_schedule(
         dates, get_random_roles_for_service(ss, "SunStopSundays"), counts, already_filled=already_filled
@@ -1498,7 +1498,7 @@ async def add_service_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(f"{service} has no randomized roles to generate — try /log_role instead.")
             return ConversationHandler.END
         await query.edit_message_text("Generating schedule...")
-        already_filled = get_already_filled(ss, dates)
+        already_filled = get_already_filled(ss.worksheet(service), dates)
         counts = load_assignment_counts(ss)
         rows, counts = generate_simple_schedule(dates, random_roles, counts, already_filled=already_filled)
         append_schedule_rows(ss, service, rows, skip_keys=already_filled)
@@ -1650,7 +1650,7 @@ async def generate_service_period(update: Update, context: ContextTypes.DEFAULT_
     # Manual-mode roles are informational only here (like Tech) — not a
     # generation blocker unless you want them to be; say so if that's wrong.
     await query.edit_message_text("Generating schedule...")
-    already_filled = get_already_filled(ss, dates)
+    already_filled = get_already_filled(ss.worksheet(service), dates)
     counts = load_assignment_counts(ss)
     unavailable = get_unavailability(ss, service, dates)
     schedule_rows, counts = generate_simple_schedule(
