@@ -2530,11 +2530,18 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
     ws = ss.worksheet(service)
     _, current = get_role_row(ws, role, date_str)
     eligible = get_role_pool(ss, service, role)
-    buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in eligible if name != current]
-    if current != LIVE_BROADCAST:
+    candidates = available_replacements(ss, service, date_str, role, current)
+    buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in candidates]
+    if current != LIVE_BROADCAST and service != "SunStopSundays":
         buttons.extend(broadcast_button(service))
+    if not buttons:
+        await query.edit_message_text(
+            f"No eligible, available replacement is listed for {role} on {date_str} "
+            "based on preferences and existing assignments."
+        )
+        return ConversationHandler.END
     await query.edit_message_text(
-        f"{role} on {date_str} is currently {current}. Substitute with:",
+        f"{role} on {date_str} is currently {current}. Choose an available replacement:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return SUB_NEW
@@ -3828,10 +3835,11 @@ PREF_SELECT_NAME, PREF_SELECT_DATE, PREF_SELECT_ROLE, PREF_CONFIRM_CONFLICT = ra
 # stay reserved so nothing else gets renumbered.)
 
 PARTAKER_PREFERENCE_NOTE = (
-    "Please select the dates you are not available to be a partaker. "
-    "No need for preachers to set their preferences as they are automatically waived for other partaker roles. "
-    "For schedule swaps and substitutions, you can submit them later via 'cancel', 'swap', 'substitutions' "
-    "and 'special request'. Please make sure to ask someone for swaps and substitutions. "
+    "Please select the dates you are NOT available to be a partaker. "
+    "No need for preachers to set their preferences, as they are automatically waived for other partaker roles. "
+    "For schedule swaps and substitutions, you can submit them later via 'swap', 'substitutions' "
+    "and 'special request'. Please make sure to ask someone ahead of time for swaps and substitutions. "
+    "If you cannot find a substitution, inform the Service Director right away. "
     "Please submit any changes in advance."
 )
 PARTAKER_COMMANDS_HINT = "(Commands: /cancel_role, /swap, /substitute, /special_request)"
@@ -3877,8 +3885,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args or not args[0].startswith("pref_"):
         await update.message.reply_text(
-            "Hi! I'm the service scheduling bot. Admins: send /menu for buttons to everything (or use /generate, /roster, and the rest) — "
-            "if someone shared a preference link with you, tap that link to set your preferences."
+            "Hi! I'm the service scheduling bot. Choose an option below. "
+            "If someone shared a preference link with you, tap that link to set your preferences.",
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU_ROWS),
         )
         return ConversationHandler.END
 
