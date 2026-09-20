@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Service Partaker Bot: how to use it</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  html { scroll-padding-top: calc(env(safe-area-inset-top, 0px) + 64px); scroll-behavior: smooth; }
+
+  :root {
+    --bg: #F3F6F9;
+    --surface: #FFFFFF;
+    --ink: #1B2530;
+    --muted: #546274;
+    --line: #D3DCE6;
+    --accent: #125F63;
+    --accent-ink: #FFFFFF;
+    --tint: #E1EFEF;
+    --chip: #E8EEF6;
+    --note-bg: #FFF5D6;
+    --note-line: #C99400;
+    --ok-bg: #E4F3E8;
+    --ok-line: #2F8A4C;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0F1720; --surface: #17222E; --ink: #E6EDF4; --muted: #9FB0C3; --line: #2A3948;
+      --accent: #6FD0CB; --accent-ink: #0B1F21; --tint: #15323A; --chip: #263547;
+      --note-bg: #2C2612; --note-line: #C79A2A; --ok-bg: #14301F; --ok-line: #4CB36F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0F1720; --surface: #17222E; --ink: #E6EDF4; --muted: #9FB0C3; --line: #2A3948;
+    --accent: #6FD0CB; --accent-ink: #0B1F21; --tint: #15323A; --chip: #263547;
+    --note-bg: #2C2612; --note-line: #C79A2A; --ok-bg: #14301F; --ok-line: #4CB36F;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 1.125rem;
+    line-height: 1.6;
+    -webkit-text-size-adjust: 100%;
+  }
+  a { color: var(--accent); }
+  h1, h2, h3 { line-height: 1.2; margin: 0; }
+  p { margin: 0 0 .9rem; max-width: 62ch; }
+  ul, ol { max-width: 62ch; }
+
+  .wrap { max-width: 780px; margin: 0 auto; padding: 0 1.1rem; }
+
+  /* top bar */
+  .bar {
+    position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10;
+    background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .bar .wrap { display: flex; gap: .4rem; align-items: center; overflow-x: auto; padding-top: .5rem; padding-bottom: .5rem; }
+  .bar strong { white-space: nowrap; margin-right: auto; padding-right: .8rem; }
+  .bar a {
+    white-space: nowrap; text-decoration: none; font-weight: 700; color: var(--ink);
+    padding: .4rem .8rem; border-radius: 999px; background: var(--chip);
+  }
+  .bar a:hover { background: var(--tint); }
+  a:focus-visible, summary:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+  /* hero */
+  .hero { padding: 2.2rem 0 1.6rem; }
+  .hero .wrap { display: grid; gap: 1.6rem; }
+  .hero h1 { font-size: clamp(2rem, 6vw, 2.9rem); letter-spacing: -0.01em; margin-bottom: .8rem; }
+  .hero .lead { font-size: 1.25rem; }
+  .who { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
+  .who a {
+    text-decoration: none; font-weight: 700; padding: .7rem 1.1rem; border-radius: 12px;
+    border: 2px solid var(--accent); color: var(--accent);
+  }
+  .who a.primary { background: var(--accent); color: var(--accent-ink); }
+  @media (min-width: 860px) {
+    .hero .wrap { max-width: 1040px; grid-template-columns: 1.05fr .95fr; align-items: center; gap: 2.4rem; }
+  }
+
+  /* the Telegram menu mock */
+  .phone { background: var(--tint); border: 1px solid var(--line); border-radius: 22px; padding: 1rem; }
+  .phone .cap { font-size: .95rem; color: var(--muted); margin: 0 0 .6rem; }
+  .bubble {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 16px 16px 16px 4px;
+    padding: .7rem .9rem; margin-bottom: .6rem; font-size: 1rem; line-height: 1.4; max-width: none;
+  }
+  .kb { display: grid; gap: .35rem; }
+  .kb .row { display: flex; gap: .35rem; }
+  .key {
+    flex: 1; text-align: center; background: var(--chip); border: 1px solid var(--line);
+    border-radius: 10px; padding: .5rem .4rem; font-size: .95rem; font-weight: 700; line-height: 1.25;
+  }
+
+  /* buttons named in the text look like the real Telegram buttons */
+  .tg {
+    display: inline-block; background: var(--chip); border: 1px solid var(--line); border-radius: 8px;
+    padding: 0 .5rem; font-weight: 700; font-size: .95em; white-space: nowrap;
+  }
+  code.cmd {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: .92em;
+    background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 0 .4rem;
+  }
+
+  section { padding: 2rem 0 .6rem; }
+  section > .wrap > h2 { font-size: 1.85rem; margin-bottom: .4rem; }
+  .sub { color: var(--muted); margin-bottom: 1.2rem; }
+  h3 { font-size: 1.25rem; margin: 1.8rem 0 .5rem; }
+
+  /* three basics */
+  .basics { display: grid; gap: .8rem; margin-top: .6rem; }
+  @media (min-width: 720px) { .basics { grid-template-columns: repeat(3, 1fr); } }
+  .basics div { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 1rem; }
+  .basics h3 { margin: 0 0 .3rem; font-size: 1.15rem; }
+  .basics p { margin: 0; font-size: 1rem; }
+
+  /* numbered steps: only used where the order really matters */
+  ol.steps { list-style: none; counter-reset: s; padding: 0; margin: .6rem 0 1rem; }
+  ol.steps > li {
+    counter-increment: s; position: relative; padding: .1rem 0 .9rem 3rem; margin: 0;
+  }
+  ol.steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 0;
+    width: 2.1rem; height: 2.1rem; border-radius: 50%; background: var(--accent); color: var(--accent-ink);
+    display: grid; place-items: center; font-weight: 700;
+  }
+  ol.steps > li:not(:last-child)::after {
+    content: ""; position: absolute; left: 1.02rem; top: 2.2rem; bottom: .15rem; width: 2px; background: var(--line);
+  }
+  ol.steps p { margin: 0; }
+
+  /* call-outs */
+  .note, .ok {
+    border-left: 5px solid var(--note-line); background: var(--note-bg);
+    padding: .8rem 1rem; border-radius: 4px 12px 12px 4px; margin: 1rem 0; max-width: 66ch;
+  }
+  .ok { border-left-color: var(--ok-line); background: var(--ok-bg); }
+  .note p:last-child, .ok p:last-child { margin-bottom: 0; }
+
+  /* expandable items */
+  details {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px; margin: .55rem 0;
+  }
+  summary {
+    list-style: none; cursor: pointer; padding: .8rem 3rem .8rem 1rem; position: relative;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary b { display: block; font-size: 1.1rem; }
+  summary small { display: block; color: var(--muted); font-size: .95rem; line-height: 1.35; margin-top: .1rem; }
+  summary::after {
+    content: "+"; position: absolute; right: 1rem; top: 50%; transform: translateY(-50%);
+    font-size: 1.6rem; font-weight: 700; color: var(--accent); line-height: 1;
+  }
+  details[open] > summary::after { content: "\2212"; }
+  details[open] > summary { border-bottom: 1px solid var(--line); }
+  .body { padding: .9rem 1rem .4rem; }
+  .body > :last-child { margin-bottom: .5rem; }
+  .body ol.steps { margin-top: .2rem; }
+
+  .tools { display: flex; gap: .5rem; flex-wrap: wrap; margin: .4rem 0 .6rem; }
+  .tools button {
+    font: inherit; font-weight: 700; cursor: pointer; padding: .45rem .9rem; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  }
+  .tools button:hover { background: var(--tint); }
+
+  /* tables */
+  .scroll { overflow-x: auto; margin: .6rem 0 1rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 1rem; }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--tint); }
+  tr:last-child td { border-bottom: 0; }
+  td:first-child { font-weight: 700; }
+
+  footer { padding: 2.5rem 0 3rem; color: var(--muted); font-size: 1rem; }
+
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  @media print {
+    .bar, .tools, .who { display: none; }
+    body { background: #fff; color: #000; font-size: 11pt; }
+    details { break-inside: avoid; }
+    summary::after { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <div class="wrap">
+    <strong>Partaker Bot</strong>
+    <a href="#partakers">For everyone</a>
+    <a href="#admin">For the admin</a>
+    <a href="#help">Help</a>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Service Partaker Bot</h1>
+      <p class="lead">A Telegram helper that keeps the service schedule and shares the roles fairly. You just tap buttons. No typing, no spreadsheets.</p>
+      <p>To start, open the bot and send <code class="cmd">/menu</code>. You will see the menu on the right.</p>
+      <div class="who">
+        <a class="primary" href="#partakers">I'm a partaker</a>
+        <a href="#admin">I'm the admin</a>
+      </div>
+    </div>
+
+    <div class="phone" role="img" aria-label="Example of the bot's button menu">
+      <p class="cap">This is what <code class="cmd">/menu</code> shows</p>
+      <div class="bubble">Scheduling menu — what would you like to do?</div>
+      <div class="kb">
+        <div class="row"><span class="key">📅 Generate schedule</span></div>
+        <div class="row"><span class="key">🎤 Set preacher</span><span class="key">🌄 Set Predawn pattern</span></div>
+        <div class="row"><span class="key">🎛 Log tech</span><span class="key">📝 Log a role</span></div>
+        <div class="row"><span class="key">🔄 Adjustments ›</span></div>
+        <div class="row"><span class="key">🔎 Pull schedule</span><span class="key">👤 Pull person</span></div>
+        <div class="row"><span class="key">➕ Add service</span><span class="key">➕ Add role</span></div>
+        <div class="row"><span class="key">👥 Roster</span><span class="key">🗳 Preferences ›</span></div>
+        <div class="row"><span class="key">📤 Bulk upload (template)</span></div>
+        <div class="row"><span class="key">🗓 Yearly renewal</span></div>
+        <div class="row"><span class="key">⚙️ More ›</span></div>
+        <div class="row"><span class="key">📖 Guide to the bot</span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section id="basics">
+  <div class="wrap">
+    <h2>Three things to know</h2>
+    <div class="basics">
+      <div>
+        <h3>Tap, don't type</h3>
+        <p>Almost everything is done with the buttons under the bot's messages.</p>
+      </div>
+      <div>
+        <h3>Stuck? Start over</h3>
+        <p>Send <code class="cmd">/cancel</code> to stop what you're doing, then <code class="cmd">/menu</code> to begin again. Lost? Tap <span class="tg">📖 Guide to the bot</span> in the menu to open this page.</p>
+      </div>
+      <div>
+        <h3>The bot is fair</h3>
+        <p>It counts everyone's roles and gives the next one to whoever has the fewest. It avoids giving anyone two roles on the same day.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== PARTAKERS ===================== -->
+<section id="partakers">
+  <div class="wrap">
+    <h2>For everyone</h2>
+    <p class="sub">If you take part in services, this is the only part you need.</p>
+
+    <h3>1. Tell the bot the dates you can't do</h3>
+    <p>Before each month's schedule is made, the admin opens a "preference round". The bot posts a message in the group with a link called <span class="tg">Set my preferences</span>.</p>
+    <ol class="steps">
+      <li><p><b>Tap the link.</b> It opens a private chat with the bot.</p></li>
+      <li><p><b>Tap your name.</b></p></li>
+      <li><p><b>Tap every date you can NOT do.</b> It shows a ✖. Tap it again to undo.</p></li>
+      <li><p><b>Tap <span class="tg">I'm done</span>.</b> Your dates are saved.</p></li>
+    </ol>
+    <div class="ok">
+      <p><b>Good to know</b></p>
+      <p>Dates you don't tap count as available. A 🎤 next to a date means you are the preacher that day, so you are already free from other roles. You can open the same link again to change your dates any time before the deadline. If you miss the deadline, you are treated as available on every date.</p>
+    </div>
+
+    <h3>2. After the schedule is out</h3>
+    <p>Plans change. Open <code class="cmd">/menu</code> and tap <span class="tg">🔄 Adjustments ›</span>. <b>Always ask the other person first</b>, then use the bot to make it official. The group is told about every change.</p>
+
+    <details>
+      <summary><b>I can't do my role</b><small>Cancel a role and pick someone to cover.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">Cancel a role</span> (or send <code class="cmd">/cancel_role</code>).</p>
+        <ol class="steps">
+          <li><p>Pick the service, then tap your name.</p></li>
+          <li><p>Tap the role and date you want to give up.</p></li>
+          <li><p>The bot lists people who are free and able to do it. <b>Ask one of them first.</b></p></li>
+          <li><p>Tap that person's name, then tap <span class="tg">Confirm</span>.</p></li>
+        </ol>
+        <p>Changed your mind? Tap <span class="tg">Never mind, keep my role</span>. Nothing changes until you confirm.</p>
+        <div class="note"><p>If the bot says nobody is available, tell the Service Director right away.</p></div>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>Two people want to trade dates</b><small>Swap dates: the same role on two different dates.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">Swap dates</span> (or send <code class="cmd">/swap</code>).</p>
+        <ol class="steps">
+          <li><p>Pick the service and the role.</p></li>
+          <li><p>Tap the first date, then the date to swap with.</p></li>
+          <li><p>The bot shows who will be on each date after the swap. Tap <span class="tg">Confirm swap</span>.</p></li>
+        </ol>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>Someone will cover me for one date</b><small>Substitute a partaker for one role on one date.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">Substitute a partaker</span> (or send <code class="cmd">/substitute</code>).</p>
+        <ol class="steps">
+          <li><p>Pick the service, the role and the date.</p></li>
+          <li><p>Tap the person who will cover. The list only shows people who are free that day.</p></li>
+          <li><p>If that person already has another role that day, the bot asks if you still want to proceed.</p></li>
+        </ol>
+        <p>On days the service is relayed from another church, you can pick <span class="tg">📡 Live broadcast</span> instead of a person.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>I'm too busy this month</b><small>Special request: limit how many roles you get.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">Special request</span> (or send <code class="cmd">/special_request</code>).</p>
+        <ol class="steps">
+          <li><p>Pick the service, then your name, then the month.</p></li>
+          <li><p>Choose the most roles you can do: 1, 2 or 3.</p></li>
+        </ol>
+        <p>The bot keeps your earliest roles and gives the extra ones to other people, fairly.</p>
+      </div>
+    </details>
+
+    <h3>3. Look up a schedule</h3>
+    <details>
+      <summary><b>See a service's schedule</b><small>Nearest date, this week (Predawn) or this month.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">🔎 Pull schedule</span>, pick the service, then pick the period.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>See my own schedule</b><small>Everything you are assigned to.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">👤 Pull person</span> and tap your name. Then choose <b>Schedule Based on Service</b> (all your dates in one service) or <b>Schedule for the Month</b> (everything in one month, across all services).</p>
+      </div>
+    </details>
+
+    <h3>4. Reminders come by themselves</h3>
+    <p>You don't need to do anything. The bot posts these in the group, in Manila time:</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>When</th><th>What</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>Wednesday, 8:30 PM</td><td>Sunday service roles and the preparation schedule</td><td>Service Partakers group</td></tr>
+          <tr><td>Sunday, 7:00 PM</td><td>Wednesday service roles and the preparation schedule</td><td>Service Partakers group</td></tr>
+          <tr><td>Friday, 8:00 PM</td><td>Filipino Translation roles for Sunday</td><td>Filipino Translators group</td></tr>
+          <tr><td>Friday, 8:00 PM</td><td>Sun Stop Sundays roles for Sunday</td><td>Service Partakers group</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Predawn has no reminder.</p>
+  </div>
+</section>
+
+<!-- ===================== ADMIN ===================== -->
+<section id="admin">
+  <div class="wrap">
+    <h2>For the admin</h2>
+    <p class="sub">Whoever runs the schedule (the Service Director). Do the steps below in this order each month.</p>
+
+    <h3>Your monthly routine</h3>
+    <ol class="steps">
+      <li><p><b>Set the preachers.</b> Tap <span class="tg">🎤 Set preacher</span> for Sunday and Wednesday. For Predawn, use <span class="tg">🌄 Set Predawn pattern</span>.</p></li>
+      <li><p><b>Do Filipino Translation first.</b> Open a preference round for it, close it, then generate its schedule. Sunday has to wait for this.</p></li>
+      <li><p><b>Open a preference round</b> for Sunday and for Wednesday. Partakers mark the dates they can't do.</p></li>
+      <li><p><b>Close each round</b> when everyone has replied. If you forget, it closes itself at the deadline.</p></li>
+      <li><p><b>Generate the schedule</b> for Sunday and Wednesday. Then generate Sun Stop Sundays, which needs no round.</p></li>
+      <li><p><b>Log the Tech people.</b> Tech is never picked by the bot. You choose.</p></li>
+      <li><p><b>Share the result.</b> Copy or forward the schedule to the group if it isn't already there.</p></li>
+    </ol>
+    <div class="note">
+      <p><b>If the bot says "Can't generate yet"</b>, it isn't broken. It tells you exactly which step is missing, usually the preacher or the preference round.</p>
+    </div>
+
+    <h3>Do once when you start</h3>
+    <details>
+      <summary><b>Register the groups</b><small>So the bot knows where to post announcements and reminders.</small></summary>
+      <div class="body">
+        <p>Open each Telegram group, send <code class="cmd">/set_group_chat</code> there, and choose <b>Service Partakers</b> or <b>Filipino Translators</b>. Do this once per group. Preference announcements and reminders won't work until it's done.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>👥 Roster</b><small>Add or remove people, and choose which roles each person can do.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">👥 Roster</span>. You can:</p>
+        <ul>
+          <li><b>Add new member:</b> type their name.</li>
+          <li><b>Add member to a role:</b> pick service, role, then the person.</li>
+          <li><b>Remove member from a role:</b> pick service, role, then the person.</li>
+          <li><b>Remove member from all roles:</b> for someone who has left or is away.</li>
+        </ul>
+        <p>Names must be spelled the same way everywhere.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>➕ Add service and ➕ Add role</b><small>Create a new kind of service, or add one more role to an existing one.</small></summary>
+      <div class="body">
+        <p><b>Add service:</b> type the name, say whether it happens monthly or weekly, add each role, and list who can do each one. For every role you choose:</p>
+        <ul>
+          <li><b>Randomize:</b> the bot picks people fairly.</li>
+          <li><b>Manual entry only:</b> you choose the person yourself, like Preacher and Tech.</li>
+        </ul>
+        <p>At the end the bot offers to generate a schedule now, or to give you a template to fill in.</p>
+        <p><b>Add role:</b> pick the service, type the role name and who can do it, then choose Randomize or Manual.</p>
+      </div>
+    </details>
+
+    <h3>Each month</h3>
+    <div class="tools" aria-label="Open or close all">
+      <button type="button" id="openAll">Open all</button>
+      <button type="button" id="closeAll">Close all</button>
+    </div>
+
+    <details>
+      <summary><b>🎤 Set preacher</b><small>Choose the preacher for each Sunday or Wednesday.</small></summary>
+      <div class="body">
+        <ol class="steps">
+          <li><p>Tap <span class="tg">🎤 Set preacher</span> and pick Sunday or Wednesday.</p></li>
+          <li><p>Pick the month.</p></li>
+          <li><p>For each date, tap the preacher. The usual one is marked <b>(default)</b>.</p></li>
+        </ol>
+        <p>The preacher is kept free of other roles that day. If you pick someone who already has a role that day, the bot asks you to confirm. On days the service comes live from another church, pick <span class="tg">📡 Live broadcast</span>.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>🌄 Set Predawn pattern</b><small>Set the weekly preachers once, then reuse them every month.</small></summary>
+      <div class="body">
+        <p>Predawn runs Monday to Saturday. Tap <span class="tg">🌄 Set Predawn pattern</span> and pick the preacher for each weekday. The bot then offers to create a month from it. Next time, just choose <b>Generate schedule</b> then <b>Predawn</b>. You only redo the pattern when the arrangement changes.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>🗳 Preferences: open and close a round</b><small>Collect the dates people can't do.</small></summary>
+      <div class="body">
+        <p><b>Open a round:</b></p>
+        <ol class="steps">
+          <li><p>Tap <span class="tg">🗳 Preferences ›</span> then <span class="tg">Open a preference round</span>.</p></li>
+          <li><p>Pick the service and the month.</p></li>
+          <li><p>Pick a deadline: 3 days, 1 week, 2 weeks (each ending at 8:00 PM), or type your own date and time as <code class="cmd">2026-10-15 20:00</code>.</p></li>
+        </ol>
+        <p>The bot posts the announcement and link in the Service Partakers group.</p>
+        <p><b>Close early:</b> tap <span class="tg">Close a round early</span> and pick the round. The bot tells the group that it's closed. Generating the schedule only works after the round is closed.</p>
+        <div class="note">
+          <p>Sunday's round can't open until Filipino Translation's round for that month is closed, and the preachers must be set first.</p>
+        </div>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>📅 Generate schedule</b><small>Fills in a whole month, fairly.</small></summary>
+      <div class="body">
+        <ol class="steps">
+          <li><p>Tap <span class="tg">📅 Generate schedule</span>.</p></li>
+          <li><p>Pick the service and the month.</p></li>
+          <li><p>The bot shows the finished schedule.</p></li>
+        </ol>
+        <p>It avoids dates people marked as unavailable. Anything already filled in is kept, so running it twice never creates doubles. If someone had to be placed on a date they marked, the bot warns you.</p>
+        <p>Pick <b>Filipino Translation</b> before Sunday, so the Filipino Preacher isn't also given Presider that day.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><b>🎛 Log tech and 📝 Log a role</b><small>For roles that you choose by hand.</small></summary>
+      <div class="body">
+        <p><b>Log tech</b> is for Onsite Tech (and Online Tech at Predawn). Pick the service, the role, and the month (or the week, for Predawn). Then tap a person for each date.</p>
+        <p><b>Log a role</b> works the same way for any hand-picked role in a service you created. It also offers <span class="tg">📡 Live broadcast</span>.</p>
+        <p>If someone already has another role that day, the bot asks you to confirm.</p>
+      </div>
+    </details>
+
+    <h3>Changes and lookups</h3>
+    <details>
+      <summary><b>🔄 Adjustments</b><small>Cancel, swap, substitute, special request, live broadcast.</small></summary>
+      <div class="body">
+        <p>The first four work exactly as described in the "For everyone" part above. As the admin, you also have one more:</p>
+        <p><b>Mark live broadcast:</b> for a day the service is relayed from another church. Pick the service, month and date. The bot sets every role that day to <b>Live broadcast</b> (Tech is left alone) and tells the group. It replaces anything already assigned that day, and it isn't available for Sun Stop Sundays.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>🔎 Pull schedule and 👤 Pull person</b><small>Look things up.</small></summary>
+      <div class="body">
+        <p><b>Pull schedule:</b> a service's nearest date, this week (Predawn only), or this month.</p>
+        <p><b>Pull person:</b> everything one person is assigned to, by service or by month.</p>
+      </div>
+    </details>
+
+    <h3>Spreadsheet tools</h3>
+    <p>The bot keeps its records in a Google Sheet. You can open it any time. <b>Please don't rename the tabs or the column headings.</b></p>
+    <details>
+      <summary><b>📤 Bulk upload (template)</b><small>Fill in a schedule offline, then send it back.</small></summary>
+      <div class="body">
+        <ol class="steps">
+          <li><p>Tap <span class="tg">📤 Bulk upload (template)</span>, pick the service and the month or week.</p></li>
+          <li><p>The bot sends you a file. Open it in Excel or Google Sheets and type names in the <b>Partaker</b> column. Use the same spelling as the roster.</p></li>
+          <li><p>Save it as a CSV and send it back to the bot in the chat.</p></li>
+        </ol>
+        <p>The bot updates the schedule and tells you how many entries it changed. Empty rows are ignored.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>⚙️ More: Refresh and Sync dashboards</b><small>Easy-to-read tables inside the Google Sheet.</small></summary>
+      <div class="body">
+        <p><b>Refresh dashboards</b> builds a "Dashboard" tab for each service, showing the next three months with dates down the side and roles across the top.</p>
+        <p>You can type names straight into those tables. After that, tap <b>Sync dashboards</b> so the bot saves what you typed. If you forget, the next refresh will erase your typing.</p>
+      </div>
+    </details>
+
+    <h3>Once a year</h3>
+    <details>
+      <summary><b>🗓 Yearly renewal</b><small>Start a fresh year.</small></summary>
+      <div class="body">
+        <p>Tap <span class="tg">🗓 Yearly renewal</span>. The bot asks you to confirm, then:</p>
+        <ul>
+          <li>moves this year's schedule into an <b>Archive</b> tab in the Google Sheet (nothing is lost),</li>
+          <li>clears the live schedule tabs,</li>
+          <li>resets everyone's fairness count to zero,</li>
+          <li>and refreshes the dashboards.</li>
+        </ul>
+        <p>Do it when the year is really finished.</p>
+      </div>
+    </details>
+
+    <h3>Who does what in each service</h3>
+    <p>This is the current setup. The roster can change it.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Service</th><th>Chosen by you</th><th>Picked fairly by the bot</th></tr></thead>
+        <tbody>
+          <tr><td>Sunday</td><td>Preacher, Onsite Tech</td><td>Presider, Representative Prayer, Praise Leader</td></tr>
+          <tr><td>Wednesday</td><td>Preacher, Onsite Tech</td><td>Presider, Representative Prayer (Praise Leader is paused for now)</td></tr>
+          <tr><td>Predawn</td><td>Preacher (weekly pattern), Onsite Tech, Online Tech</td><td>None for now</td></tr>
+          <tr><td>Sun Stop Sundays</td><td>Onsite Tech</td><td>Praise Leader, Opening Prayer, Welcome Remarks, Testimony (each given to a department)</td></tr>
+          <tr><td>Filipino Translation</td><td>None</td><td>Initial Proofreading, 2nd PR, Filipino Preacher</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <details>
+      <summary><b>All commands at a glance</b><small>Every button also has a typed shortcut.</small></summary>
+      <div class="body">
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Type this</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td>/menu</td><td>Shows the button menu</td></tr>
+              <tr><td>/cancel</td><td>Stops whatever you're doing</td></tr>
+              <tr><td>/generate</td><td>Generate a schedule</td></tr>
+              <tr><td>/set_preacher</td><td>Set Sunday or Wednesday preachers</td></tr>
+              <tr><td>/set_predawn_pattern</td><td>Set the weekly Predawn preachers</td></tr>
+              <tr><td>/generate_predawn</td><td>Create a Predawn month from the pattern</td></tr>
+              <tr><td>/generate_sunstop</td><td>Generate Sun Stop Sundays</td></tr>
+              <tr><td>/generate_service</td><td>Generate a service you created</td></tr>
+              <tr><td>/log_tech</td><td>Enter Tech people</td></tr>
+              <tr><td>/log_role</td><td>Enter hand-picked roles</td></tr>
+              <tr><td>/open_preferences</td><td>Open a preference round</td></tr>
+              <tr><td>/close_preferences</td><td>Close a round early</td></tr>
+              <tr><td>/cancel_role</td><td>Give up a role and find cover</td></tr>
+              <tr><td>/swap</td><td>Swap two dates</td></tr>
+              <tr><td>/substitute</td><td>Replace someone for one date</td></tr>
+              <tr><td>/special_request</td><td>Limit someone's roles for a month</td></tr>
+              <tr><td>/mark_broadcast</td><td>Mark a date as live broadcast</td></tr>
+              <tr><td>/pull_schedule</td><td>Look up a service's schedule</td></tr>
+              <tr><td>/pull_person</td><td>Look up one person's schedule</td></tr>
+              <tr><td>/add_service, /add_role</td><td>Create a service, or add a role</td></tr>
+              <tr><td>/roster</td><td>Manage people and roles</td></tr>
+              <tr><td>/template</td><td>Get a fill-in file for bulk upload</td></tr>
+              <tr><td>/refresh_dashboard, /sync_dashboard</td><td>Rebuild the dashboards, or save what you typed there</td></tr>
+              <tr><td>/set_group_chat</td><td>Register a group for reminders</td></tr>
+              <tr><td>/renew_year</td><td>Archive the year and start fresh</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ===================== HELP ===================== -->
+<section id="help">
+  <div class="wrap">
+    <h2>If something looks wrong</h2>
+    <p class="sub">Most problems are fixed with the first two lines.</p>
+
+    <details>
+      <summary><b>Buttons do nothing, or the bot seems stuck</b><small>Start fresh.</small></summary>
+      <div class="body">
+        <p>Send <code class="cmd">/cancel</code>, then <code class="cmd">/menu</code>, and use the new buttons. Buttons on old messages can stop working.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>"Google Sheets is rate-limiting me"</b><small>Too many requests at once.</small></summary>
+      <div class="body">
+        <p>Wait one minute, then try once. Tapping repeatedly makes it worse.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>"Something went wrong" with a code in brackets</b><small>For example (KeyError).</small></summary>
+      <div class="body">
+        <p>Try again in a moment. If it keeps happening, send the admin a screenshot of the message, so they can find the cause.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>"Can't generate yet" or "Can't open preferences yet"</b><small>Not an error. A step is missing.</small></summary>
+      <div class="body">
+        <p>Read the message. It names the step to do first, such as setting the preacher or closing the Filipino Translation round.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>The wrong person is scheduled</b><small>Fix it without starting over.</small></summary>
+      <div class="body">
+        <p>Use <span class="tg">Substitute a partaker</span> for one date, or <span class="tg">Swap dates</span> for two. You can also type the correct name in the Dashboard tab in the Google Sheet, then tap <b>Sync dashboards</b>.</p>
+      </div>
+    </details>
+    <details>
+      <summary><b>The bot doesn't answer at all</b><small>It may be switched off.</small></summary>
+      <div class="body">
+        <p>Tell the person who looks after the bot's server. It may need to be restarted.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Tip: save this page as a bookmark in Telegram, or print it. All the sections open when you print.</p>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var all = function () { return document.querySelectorAll('details'); };
+    document.getElementById('openAll').addEventListener('click', function () {
+      all().forEach(function (d) { d.open = true; });
+    });
+    document.getElementById('closeAll').addEventListener('click', function () {
+      all().forEach(function (d) { d.open = false; });
+    });
+    window.addEventListener('beforeprint', function () {
+      all().forEach(function (d) { d.open = true; });
+    });
+  })();
+</script>
+</body>
+</html>
