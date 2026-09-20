@@ -35,14 +35,14 @@ _original_gspread_request = _GspreadHTTPClient.request
 
 
 def _gspread_request_with_retry(self, *args, **kwargs):
-    max_retries = 5
+    max_retries = 6  # waits ~2+4+8+16+30s: long enough to outlast the per-minute quota window
     for attempt in range(max_retries):
         try:
             return _original_gspread_request(self, *args, **kwargs)
         except _GspreadAPIError as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 429 and attempt < max_retries - 1:
-                wait = (2 ** attempt) + random.random()
+                wait = min(2 ** (attempt + 1), 30) + random.random()
                 logging.warning(f"Sheets API rate limited (429) — retrying in {wait:.1f}s (attempt {attempt + 1})")
                 time.sleep(wait)
                 continue
@@ -50,6 +50,133 @@ def _gspread_request_with_retry(self, *args, **kwargs):
 
 
 _GspreadHTTPClient.request = _gspread_request_with_retry
+
+
+# --- Read cache: keep the bot under Google's Sheets read quota (~60/min) ---
+# In gspread every ss.worksheet(), ss.worksheets(), get_all_records(),
+# get_all_values(), col_values() and row_values() call is a separate API read,
+# and a single button tap in this bot can trigger dozens of them (setup_sheet
+# alone used to make ~16). This layer:
+#   * reuses worksheet()/worksheets() metadata for META_CACHE_TTL seconds
+#   * reuses read results for READ_CACHE_TTL seconds
+#   * drops a sheet's cached reads the moment the bot writes to it, so the bot
+#     always sees its own changes immediately
+# Edits typed directly into the Sheet show up within READ_CACHE_TTL seconds
+# (clear_read_cache() is also called before /sync_dashboard).
+import copy
+from gspread.spreadsheet import Spreadsheet as _GspreadSpreadsheet
+from gspread.worksheet import Worksheet as _GspreadWorksheet
+
+READ_CACHE_TTL = 10   # seconds
+META_CACHE_TTL = 120  # seconds
+
+_read_cache = {}  # ((spreadsheet_id, sheet_id), method, args) -> (timestamp, value)
+_meta_cache = {}  # (spreadsheet_id, kind, arg) -> (timestamp, value)
+
+
+def clear_read_cache():
+    """Forget every cached read (forces fresh reads on the next access)."""
+    _read_cache.clear()
+    _meta_cache.clear()
+
+
+def _invalidate_worksheet(ws):
+    sheet_key = (ws.spreadsheet_id, ws.id)
+    for k in [k for k in _read_cache if k[0] == sheet_key]:
+        _read_cache.pop(k, None)
+
+
+def _invalidate_meta(spreadsheet):
+    for k in [k for k in _meta_cache if k[0] == spreadsheet.id]:
+        _meta_cache.pop(k, None)
+
+
+def _make_cached_reader(cls, name):
+    original = getattr(cls, name)
+
+    def wrapper(self, *args, **kwargs):
+        key = ((self.spreadsheet_id, self.id), name, repr(args), repr(sorted(kwargs.items())))
+        hit = _read_cache.get(key)
+        if hit and time.time() - hit[0] < READ_CACHE_TTL:
+            return copy.deepcopy(hit[1])
+        value = original(self, *args, **kwargs)
+        _read_cache[key] = (time.time(), copy.deepcopy(value))
+        return value
+
+    wrapper.__name__ = name
+    return wrapper
+
+
+def _make_invalidating_writer(cls, name):
+    original = getattr(cls, name)
+
+    def wrapper(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _invalidate_worksheet(self)
+
+    wrapper.__name__ = name
+    return wrapper
+
+
+_CACHED_READERS = ("get_all_records", "get_all_values", "col_values", "row_values")
+_INVALIDATING_WRITERS = (
+    "update", "update_cell", "update_cells", "update_acell", "batch_update",
+    "append_row", "append_rows", "insert_row", "insert_rows", "delete_rows",
+    "clear", "batch_clear", "resize", "add_rows", "add_cols",
+)
+
+
+def _install_read_cache(worksheet_cls, spreadsheet_cls):
+    for name in _CACHED_READERS:
+        setattr(worksheet_cls, name, _make_cached_reader(worksheet_cls, name))
+    for name in _INVALIDATING_WRITERS:
+        if hasattr(worksheet_cls, name):
+            setattr(worksheet_cls, name, _make_invalidating_writer(worksheet_cls, name))
+
+    orig_worksheet = spreadsheet_cls.worksheet
+    orig_worksheets = spreadsheet_cls.worksheets
+    orig_add_worksheet = spreadsheet_cls.add_worksheet
+    orig_del_worksheet = spreadsheet_cls.del_worksheet
+
+    def worksheet(self, title):
+        key = (self.id, "ws", title)
+        hit = _meta_cache.get(key)
+        if hit and time.time() - hit[0] < META_CACHE_TTL:
+            return hit[1]
+        ws = orig_worksheet(self, title)  # raises WorksheetNotFound if missing (not cached)
+        _meta_cache[key] = (time.time(), ws)
+        return ws
+
+    def worksheets(self, *args, **kwargs):
+        key = (self.id, "all", repr(args) + repr(sorted(kwargs.items())))
+        hit = _meta_cache.get(key)
+        if hit and time.time() - hit[0] < META_CACHE_TTL:
+            return list(hit[1])
+        result = orig_worksheets(self, *args, **kwargs)
+        _meta_cache[key] = (time.time(), list(result))
+        return result
+
+    def add_worksheet(self, *args, **kwargs):
+        try:
+            return orig_add_worksheet(self, *args, **kwargs)
+        finally:
+            _invalidate_meta(self)
+
+    def del_worksheet(self, *args, **kwargs):
+        try:
+            return orig_del_worksheet(self, *args, **kwargs)
+        finally:
+            _invalidate_meta(self)
+
+    spreadsheet_cls.worksheet = worksheet
+    spreadsheet_cls.worksheets = worksheets
+    spreadsheet_cls.add_worksheet = add_worksheet
+    spreadsheet_cls.del_worksheet = del_worksheet
+
+
+_install_read_cache(_GspreadWorksheet, _GspreadSpreadsheet)
 
 
 
@@ -226,22 +353,42 @@ DASHBOARD_MONTHS_AHEAD = 3  # how many upcoming months each dashboard tab shows
 # Google Sheets helpers
 # ---------------------------------------------------------------------------
 
+_client = None
+
+
 def get_client():
     """GOOGLE_CREDS_JSON can be either the full service-account JSON pasted
     directly into the env var (Railway-friendly — no file to manage) or a
-    path to a JSON key file (handy for local testing)."""
+    path to a JSON key file (handy for local testing). The authorized client
+    is created once and reused (its token refreshes itself)."""
+    global _client
+    if _client is not None:
+        return _client
     raw = GOOGLE_CREDS_JSON.strip()
     if raw.startswith("{"):
         creds = Credentials.from_service_account_info(json.loads(raw), scopes=SCOPES)
     else:
         creds = Credentials.from_service_account_file(raw, scopes=SCOPES)
-    return gspread.authorize(creds)
+    _client = gspread.authorize(creds)
+    return _client
+
+
+_setup_ss = None
+_setup_checked_at = 0.0
+SETUP_RECHECK_SECONDS = 600  # full tab/header/roster check at most every 10 minutes
 
 
 def setup_sheet():
     """Idempotent: creates any missing tabs + headers, and seeds the Roster
     tab with every unique name across Sunday + Wednesday roles (count=0) if
-    they aren't already present. Safe to re-run."""
+    they aren't already present. Safe to re-run.
+
+    This is called at the start of almost every command/button, and the full
+    check costs ~16 Sheets reads, so it only really runs once per
+    SETUP_RECHECK_SECONDS; in between the already-opened spreadsheet is returned."""
+    global _setup_ss, _setup_checked_at
+    if _setup_ss is not None and time.time() - _setup_checked_at < SETUP_RECHECK_SECONDS:
+        return _setup_ss
     gc = get_client()
     ss = gc.open_by_key(SPREADSHEET_ID)
     existing = {ws.title for ws in ss.worksheets()}
@@ -301,6 +448,8 @@ def setup_sheet():
     if builtin_rows:
         config_ws.append_rows(builtin_rows)
 
+    _setup_ss = ss
+    _setup_checked_at = time.time()
     return ss
 
 
@@ -3151,6 +3300,7 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
     path = f"/tmp/upload_{doc.file_unique_id}.csv"
     await tg_file.download_to_drive(path)
 
+    clear_read_cache()
     ss = setup_sheet()
     by_service = defaultdict(list)
     # utf-8-sig strips the BOM that Excel adds, which would otherwise turn the
@@ -3422,6 +3572,7 @@ async def refresh_dashboard_command(update: Update, context: ContextTypes.DEFAUL
 
 
 async def sync_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_read_cache()  # admins just typed into the sheet by hand — never sync from a cached copy
     ss = setup_sheet()
     counts = sync_all_dashboards(ss)
     if not counts:
@@ -4301,12 +4452,30 @@ async def menu_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # any unhandled exception otherwise — the person who triggered it never
 # hears back at all. Registered at the end of build_app().
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    logging.getLogger(__name__).error("Unhandled exception", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
+    err = context.error
+    logging.getLogger(__name__).error("Unhandled exception", exc_info=err)
+    if not isinstance(update, Update):
+        return
+
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    if isinstance(err, _GspreadAPIError) and status == 429:
+        text = ("⚠️ Google Sheets is rate-limiting me right now (too many requests). "
+                "Please wait about a minute and try again.")
+    else:
+        text = (f"⚠️ Something went wrong ({type(err).__name__}). "
+                f"Please try again in a moment — if it keeps happening, tell the admin.")
+
+    # If this came from a button tap, replace the stuck message (e.g. "Generating
+    # schedule...") so it never just hangs; otherwise send a fresh reply.
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        elif update.effective_message:
+            await update.effective_message.reply_text(text)
+    except Exception:
         try:
-            await update.effective_message.reply_text(
-                "Something went wrong on my end — please try that again in a moment."
-            )
+            if update.effective_message:
+                await update.effective_message.reply_text(text)
         except Exception:
             pass
 
