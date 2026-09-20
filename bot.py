@@ -188,6 +188,10 @@ BOT_TOKEN = os.environ["SERVICE_PARTAKER_BOT_TOKEN"]
 SPREADSHEET_ID = os.environ["SERVICE_PARTAKER_SHEET_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]  # path or inline JSON, match your other bots' setup
 BOT_USERNAME = os.environ["SERVICE_PARTAKER_BOT_USERNAME"]  # no @, e.g. "MyChurchSchedulerBot" — used to build deep links
+# Link opened by the "📖 Guide to the bot" menu button. Override with a GUIDE_URL
+# environment variable (e.g. if you host the guide elsewhere); set it to an empty
+# value to hide the button.
+GUIDE_URL = os.environ.get("GUIDE_URL", "https://claude.ai/artifact/R4oa2nCUbQyR8PTv39Cw6o").strip()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -4396,6 +4400,11 @@ MAIN_MENU_ROWS = [
     [_menu_btn("🗓 Yearly renewal", "renew_year")],
     [_menu_btn("⚙️ More ›", "more")],
 ]
+
+# A URL button opens the link directly (no bot round-trip), so it works from the
+# /menu message and from the /start welcome message alike.
+if GUIDE_URL:
+    MAIN_MENU_ROWS.append([InlineKeyboardButton("📖 Guide to the bot", url=GUIDE_URL)])
 
 SUBMENUS = {
     "adjust": ("Adjustments — what would you like to do?", [
