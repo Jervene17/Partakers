@@ -191,7 +191,7 @@ BOT_USERNAME = os.environ["SERVICE_PARTAKER_BOT_USERNAME"]  # no @, e.g. "MyChur
 # Link opened by the "📖 Guide to the bot" menu button. Override with a GUIDE_URL
 # environment variable (e.g. if you host the guide elsewhere); set it to an empty
 # value to hide the button.
-GUIDE_URL = os.environ.get("GUIDE_URL", "https://claude.ai/artifact/R4oa2nCUbQyR8PTv39Cw6o").strip()
+GUIDE_URL = os.environ.get("GUIDE_URL", "https://jervene17.github.io/Partakers/").strip()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -2567,6 +2567,119 @@ async def announce_update(context, ss, text):
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
+# --- Double-role safety: used by /swap (and the Dashboard / CSV paths) ---
+#
+# The generator never gives the Preacher another role on the same date, but
+# once a schedule exists, changing a Preacher (or anyone) by swap can put a
+# person on two roles the same day. plan_swap() spots that BEFORE the swap and
+# proposes moving the person's other (randomly-picked) role to a free partaker.
+
+def apply_reassignment(ss, service, role, date_str, new_partaker, adj_type="swap_move", reason=""):
+    """Changes who holds `role` on `date_str`: updates the sheet, logs it, and
+    keeps the equal-share counts right (randomly-picked roles only). Returns
+    the previous holder, or None if that slot doesn't exist."""
+    ws = ss.worksheet(service)
+    row_num, old_partaker = get_role_row(ws, role, date_str)
+    if row_num is None:
+        return None
+    ws.update_cell(row_num, 3, new_partaker)
+    log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, adj_type, reason)
+    if role in get_random_roles_for_service(ss, service) and new_partaker != LIVE_BROADCAST:
+        counts = load_assignment_counts(ss)
+        if old_partaker and old_partaker != LIVE_BROADCAST:
+            counts[old_partaker] = max(0, counts[old_partaker] - 1)
+        counts[new_partaker] += 1
+        save_assignment_counts(ss, counts)
+    return old_partaker
+
+
+def plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b):
+    """Works out what a swap of `role` between date_a and date_b would cause.
+    Returns {"role", "conflicts", "moves", "unmovable"}:
+      conflicts - [{"person", "date", "roles"}]: someone who would end up with
+                  another role on the same date
+      moves     - [{"date", "role", "old", "new"}]: proposed fix, giving that
+                  other role to a free, eligible person (fewest roles first)
+      unmovable - conflicts that can't be fixed automatically (Preacher/Tech/
+                  hand-picked roles, roles in the other service's tab, or
+                  nobody free)"""
+    plan = {"role": role, "conflicts": [], "moves": [], "unmovable": []}
+    if not partaker_a or not partaker_b or partaker_a == partaker_b:
+        return plan
+
+    random_roles = get_random_roles_for_service(ss, service)
+    counts = load_assignment_counts(ss)
+    chosen_on = defaultdict(set)  # date -> people already picked as a fix in this plan
+
+    # the person arriving on each date, and the date they arrive on
+    for person, target in ((partaker_b, date_a), (partaker_a, date_b)):
+        if person == LIVE_BROADCAST:
+            continue
+        same_tab = get_person_roles_on_date(ss, service, target, person, ignore_role=role)
+        cross_tab = get_cross_service_conflicts(ss, service, target, person)
+        if not same_tab and not cross_tab:
+            continue
+        plan["conflicts"].append({"person": person, "date": target, "roles": same_tab + cross_tab})
+
+        for other_role in same_tab:
+            if other_role not in random_roles:
+                plan["unmovable"].append({"person": person, "date": target, "role": other_role,
+                                          "reason": "it is not an automatically picked role"})
+                continue
+            candidates = [c for c in available_replacements(ss, service, target, other_role, person)
+                          if c not in chosen_on[target]]
+            if not candidates:
+                plan["unmovable"].append({"person": person, "date": target, "role": other_role,
+                                          "reason": "nobody else eligible is free that day"})
+                continue
+            fewest = min(counts[c] for c in candidates)
+            new_person = random.choice([c for c in candidates if counts[c] == fewest])
+            chosen_on[target].add(new_person)
+            plan["moves"].append({"date": target, "role": other_role, "old": person, "new": new_person})
+        for other_role in cross_tab:
+            plan["unmovable"].append({"person": person, "date": target, "role": other_role,
+                                      "reason": "it belongs to the other service's schedule"})
+    return plan
+
+
+def describe_swap_plan(plan):
+    lines = ["⚠️ Double role warning:"]
+    for c in plan["conflicts"]:
+        lines.append(f"- {c['person']} would take {plan['role']} on {c['date']} but already has "
+                     f"{', '.join(c['roles'])} that day.")
+    if plan["moves"] and not plan["unmovable"]:
+        lines += ["", "Suggested fix (Swap + move their other role):"]
+        for m in plan["moves"]:
+            lines.append(f"- {m['date']} {m['role']}: {m['old']} -> {m['new']}")
+    for u in plan["unmovable"]:
+        lines.append(f"- Can't move {u['person']}'s {u['role']} on {u['date']}: {u['reason']}.")
+    return "\n".join(lines)
+
+
+def find_double_bookings(ss, service, dates):
+    """[(date, person, [roles])] for anyone holding 2+ roles on the same date
+    in this service. 'Live broadcast' rows are ignored."""
+    date_set = set(dates)
+    held = defaultdict(list)
+    for r in ss.worksheet(service).get_all_records():
+        person = r.get("Partaker")
+        if r.get("Date") in date_set and person and person != LIVE_BROADCAST:
+            held[(r["Date"], person)].append(r["Role"])
+    return [(d, p, roles) for (d, p), roles in sorted(held.items()) if len(roles) > 1]
+
+
+def double_booking_warnings(ss, service, changed):
+    """changed: [(date_str, role, partaker)] just written by a sync/upload.
+    Returns readable lines for people those edits left with two roles that day
+    (older, untouched double roles are not repeated)."""
+    if not changed:
+        return []
+    touched = {(d, p) for d, _role, p in changed}
+    return [f"{d}: {p} has {' + '.join(roles)}"
+            for d, p, roles in find_double_bookings(ss, service, {d for d, _r, _p in changed})
+            if (d, p) in touched]
+
+
 # --- /swap: two dates trade partakers for the same role ---
 
 SWAP_SERVICE, SWAP_ROLE, SWAP_DATE_A, SWAP_DATE_B, SWAP_CONFIRM = range(50, 55)
@@ -2624,28 +2737,41 @@ async def swap_select_date_b(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     date_b = query.data
     context.user_data["swap_date_b"] = date_b
+    ss = context.user_data["swap_ss"]
     service = context.user_data["swap_service"]
     role = context.user_data["swap_role"]
     date_a = context.user_data["swap_date_a"]
-    ws = context.user_data["swap_ss"].worksheet(service)
+    ws = ss.worksheet(service)
     _, partaker_a = get_role_row(ws, role, date_a)
     _, partaker_b = get_role_row(ws, role, date_b)
-    buttons = [
-        [InlineKeyboardButton("Confirm swap", callback_data="yes")],
-        [InlineKeyboardButton("Cancel", callback_data="no")],
-    ]
-    await query.edit_message_text(
+    plan = plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b)
+
+    text = (
         f"Swap {role}:\n{date_a}: {partaker_a}\n{date_b}: {partaker_b}\n\n"
-        f"After swap: {date_a} -> {partaker_b}, {date_b} -> {partaker_a}",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"After swap: {date_a} -> {partaker_b}, {date_b} -> {partaker_a}"
     )
+    if not plan["conflicts"]:
+        buttons = [
+            [InlineKeyboardButton("Confirm swap", callback_data="yes")],
+            [InlineKeyboardButton("Cancel", callback_data="no")],
+        ]
+    else:
+        text += "\n\n" + describe_swap_plan(plan)
+        buttons = []
+        if plan["moves"] and not plan["unmovable"]:
+            buttons.append([InlineKeyboardButton("Swap + move their other role", callback_data="move")])
+        buttons.append([InlineKeyboardButton("Swap anyway (keep both roles)", callback_data="keep")])
+        buttons.append([InlineKeyboardButton("Cancel", callback_data="no")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     return SWAP_CONFIRM
 
 
 async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data != "yes":
+    choice = query.data  # "yes" (no conflicts), "keep", "move", or anything else = cancel
+    if choice not in ("yes", "keep", "move"):
         await query.edit_message_text("Swap cancelled.")
         return ConversationHandler.END
 
@@ -2658,6 +2784,19 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row_a, partaker_a = get_role_row(ws, role, date_a)
     row_b, partaker_b = get_role_row(ws, role, date_b)
+
+    # re-check right now: the sheet may have changed since the screen was shown
+    plan = plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b)
+    moves = []
+    if choice == "move":
+        if plan["unmovable"]:
+            await query.edit_message_text(
+                "Things changed while you were deciding, so their other role can no longer be moved "
+                "automatically. Nothing was changed — please run /swap again."
+            )
+            return ConversationHandler.END
+        moves = plan["moves"]
+
     ws.update_cell(row_a, 3, partaker_b)
     ws.update_cell(row_b, 3, partaker_a)
     log_adjustment(ss, service, date_a, role, partaker_a, partaker_b, "swap")
@@ -2668,6 +2807,17 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{date_a}: {partaker_a} -> {partaker_b}\n"
         f"{date_b}: {partaker_b} -> {partaker_a}"
     )
+    for m in moves:
+        apply_reassignment(ss, service, m["role"], m["date"], m["new"], adj_type="swap_move",
+                           reason=f"{m['old']} took {role} that day")
+    if moves:
+        text += "\n\nOther role moved because of the swap:\n" + "\n".join(
+            f"{m['date']} {m['role']}: {m['old']} -> {m['new']}" for m in moves
+        )
+    elif plan["conflicts"]:
+        text += "\n\nNote: " + "; ".join(
+            f"{c['person']} has {', '.join(c['roles'])} and {role} on {c['date']}" for c in plan["conflicts"]
+        )
     await query.edit_message_text(text)
     await announce_update(context, ss, text)
     return ConversationHandler.END
@@ -3325,27 +3475,37 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
     known_tabs = {ws.title for ws in ss.worksheets()}
     total = 0
     skipped = []
+    warnings = []
     for service, entries in by_service.items():
         if service not in known_tabs:
             skipped.append(service or "(blank)")
             continue
         ws = ss.worksheet(service)
         records = ws.get_all_records()
-        row_index = {(r["Date"], r["Role"]): i + 2 for i, r in enumerate(records)}
-        new_rows = []
+        row_index = {(r["Date"], r["Role"]): (i + 2, r["Partaker"]) for i, r in enumerate(records)}
+        new_rows, changed = [], []
         for date_str, role, partaker in entries:
             key = (date_str, role)
             if key in row_index:
-                ws.update_cell(row_index[key], 3, partaker)
+                row_num, current = row_index[key]
+                if current != partaker:
+                    ws.update_cell(row_num, 3, partaker)
+                    changed.append((date_str, role, partaker))
             else:
                 new_rows.append([date_str, role, partaker, "scheduled"])
+                changed.append((date_str, role, partaker))
             total += 1
         if new_rows:
             ws.append_rows(new_rows)
+        warnings.extend(f"{service} {w}" for w in double_booking_warnings(ss, service, changed))
 
     msg = f"Bulk upload processed: {total} entr{'y' if total == 1 else 'ies'} updated."
     if skipped:
         msg += f"\nSkipped unknown service(s): {', '.join(skipped)}"
+    if warnings:
+        msg += ("\n\n⚠️ This upload left someone with two roles on the same day:\n"
+                + "\n".join(f"- {w}" for w in warnings)
+                + "\nUse /swap or /substitute to fix it.")
     await update.message.reply_text(msg)
 
 
@@ -3528,7 +3688,10 @@ def parse_dashboard_grid(ws):
     return entries
 
 
-def sync_service_dashboard(ss, service):
+def sync_service_dashboard(ss, service, warnings=None):
+    """Saves what admins typed into a service's Dashboard tab. Only cells that
+    actually differ are written. If `warnings` (a list) is given, lines about
+    anyone these edits left with two roles on the same day are added to it."""
     tab = dashboard_tab_name(service)
     existing_tabs = {ws.title for ws in ss.worksheets()}
     if tab not in existing_tabs:
@@ -3540,26 +3703,32 @@ def sync_service_dashboard(ss, service):
 
     ws = ss.worksheet(service)
     records = ws.get_all_records()
-    row_index = {(r["Date"], r["Role"]): i + 2 for i, r in enumerate(records)}
-    new_rows = []
+    row_index = {(r["Date"], r["Role"]): (i + 2, r["Partaker"]) for i, r in enumerate(records)}
+    new_rows, changed = [], []
     total = 0
     for date_str, role, partaker in entries:
         key = (date_str, role)
         if key in row_index:
-            ws.update_cell(row_index[key], 3, partaker)
+            row_num, current = row_index[key]
+            if current != partaker:
+                ws.update_cell(row_num, 3, partaker)
+                changed.append((date_str, role, partaker))
         else:
             new_rows.append([date_str, role, partaker, "scheduled"])
+            changed.append((date_str, role, partaker))
         total += 1
     if new_rows:
         ws.append_rows(new_rows)
+    if warnings is not None:
+        warnings.extend(f"{service} {w}" for w in double_booking_warnings(ss, service, changed))
     return total
 
 
-def sync_all_dashboards(ss):
+def sync_all_dashboards(ss, warnings=None):
     """Returns {service: row_count} for every dashboard tab that exists."""
     counts = {}
     for service in get_all_schedule_tabs(ss):
-        n = sync_service_dashboard(ss, service)
+        n = sync_service_dashboard(ss, service, warnings)
         if n:
             counts[service] = n
     return counts
@@ -3578,12 +3747,18 @@ async def refresh_dashboard_command(update: Update, context: ContextTypes.DEFAUL
 async def sync_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_read_cache()  # admins just typed into the sheet by hand — never sync from a cached copy
     ss = setup_sheet()
-    counts = sync_all_dashboards(ss)
+    warnings = []
+    counts = sync_all_dashboards(ss, warnings)
     if not counts:
         await update.message.reply_text("No dashboard edits found to sync.")
         return
     lines = "\n".join(f"- {s}: {n} entr{'y' if n == 1 else 'ies'}" for s, n in counts.items())
-    await update.message.reply_text(f"Synced back to service tabs:\n{lines}")
+    msg = f"Synced back to service tabs:\n{lines}"
+    if warnings:
+        msg += ("\n\n⚠️ These edits left someone with two roles on the same day:\n"
+                + "\n".join(f"- {w}" for w in warnings)
+                + "\nUse /swap or /substitute to fix it.")
+    await update.message.reply_text(msg)
 
 
 # ---------------------------------------------------------------------------
