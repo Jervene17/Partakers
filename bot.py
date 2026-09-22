@@ -666,7 +666,7 @@ def week_dates(service, monday):
     return [monday + dt.timedelta(days=i) for i in range(7)]
 
 
-def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude=None):
+def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude=None, never=None):
     """Pick from eligible people, weighted toward whoever has the fewest
     total assignments so far (equal share, combined across all roles).
 
@@ -675,8 +675,12 @@ def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude
       hard_exclude = role-specific hard rule, e.g. Filipino Preacher -> Presider)
     - soft_exclude: avoided when a valid alternative exists, but allowed if
       it's the only option left (e.g. Filipino Preacher -> other roles)
+    - never: people who must NEVER be picked for this role, even as a last
+      resort (unlike hard_exclude, no fallback ever brings them back)
     Ties broken randomly. Returns None if the role has nobody eligible at all.
     """
+    never = set(never or ())
+    eligible = [p for p in eligible if p not in never]
     if not eligible:
         return None
 
@@ -813,7 +817,8 @@ def generate_predawn_schedule(dates, counts, preacher_assignments, roles=None, a
     return rows, counts
 
 
-def generate_simple_schedule(dates, roles, counts, already_filled=None, unavailable=None):
+def generate_simple_schedule(dates, roles, counts, already_filled=None, unavailable=None, never_by_role=None,
+                             soft_avoid_from_role=None):
     """Generic equal-share generator for services with no manual-preacher
     precondition and no cross-role exclusions beyond "not more than 1 role
     per date" — used for Predawn's non-Preacher roles, Sun Stop Sundays
@@ -822,9 +827,19 @@ def generate_simple_schedule(dates, roles, counts, already_filled=None, unavaila
     `already_filled`: see generate_schedule — same skip/exclude/no-recount
     behavior, for slots claimed in a preference round. `unavailable` is
     {date_str: set(names)} — hard-excluded that date, like generate_schedule.
+    `never_by_role`: {role: {date_str: set(names)}} — people who must never get
+    that role on that date (e.g. the English Preacher can't be Filipino Preacher).
+    `soft_avoid_from_role`: {target_role: source_role} — once someone is given
+    source_role on any date in this run, avoid also giving them target_role on
+    a LATER date, unless nobody else eligible is available (e.g. someone who is
+    the Filipino Preacher one Sunday is avoided, not blocked, for Initial
+    Proofreading another Sunday, so they mainly just preach).
     Returns (rows, counts)."""
     already_filled = already_filled or {}
     unavailable = unavailable or {}
+    never_by_role = never_by_role or {}
+    soft_avoid_from_role = soft_avoid_from_role or {}
+    role_history = defaultdict(set)  # role -> everyone already given that role earlier in this run
     rows = []
     for d in dates:
         date_str = d.isoformat()
@@ -834,13 +849,19 @@ def generate_simple_schedule(dates, roles, counts, already_filled=None, unavaila
                 taken_today.add(fperson)
         for role, eligible in roles.items():
             if (date_str, role) in already_filled:
-                rows.append((date_str, role, already_filled[(date_str, role)]))
+                person = already_filled[(date_str, role)]
+                rows.append((date_str, role, person))
+                role_history[role].add(person)
                 continue
-            person = pick_partaker(eligible, counts, taken_today, hard_exclude=set(unavailable.get(date_str, ())))
+            source_role = soft_avoid_from_role.get(role)
+            soft_exclude = set(role_history[source_role]) if source_role else None
+            person = pick_partaker(eligible, counts, taken_today, hard_exclude=set(unavailable.get(date_str, ())),
+                                   soft_exclude=soft_exclude, never=never_by_role.get(role, {}).get(date_str))
             if person is None:
                 continue  # nobody eligible for this role — leave it unassigned
             taken_today.add(person)
             counts[person] += 1
+            role_history[role].add(person)
             rows.append((date_str, role, person))
     return rows, counts
 
@@ -957,7 +978,7 @@ async def preacher_select_month(update: Update, context: ContextTypes.DEFAULT_TY
     return await preacher_ask_next_date(query, context)
 
 
-async def preacher_ask_next_date(query, context: ContextTypes.DEFAULT_TYPE):
+async def preacher_ask_next_date(query, context: ContextTypes.DEFAULT_TYPE, note=""):
     pending = context.user_data["preacher_pending_dates"]
     if not pending:
         ss = context.user_data["preacher_ss"]
@@ -987,7 +1008,7 @@ async def preacher_ask_next_date(query, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton(label, callback_data=name)])
     buttons.extend(broadcast_button(service_type))
     await query.edit_message_text(
-        f"Preacher for {d.strftime('%B %d, %Y')}?", reply_markup=InlineKeyboardMarkup(buttons)
+        f"{note}Preacher for {d.strftime('%B %d, %Y')}?", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return PREACHER_PICK
 
@@ -1000,6 +1021,14 @@ async def preacher_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss = context.user_data["preacher_ss"]
     service_type = context.user_data["preacher_service_type"]
     date_str = d.isoformat()
+
+    # Sunday's English Preacher can never also be that day's Filipino Preacher.
+    if service_type == "Sunday" and forbidden_conflict(ss, "Sunday", "Preacher", date_str, name):
+        return await preacher_ask_next_date(
+            query, context,
+            note=f"⛔ {name} is already the Filipino Preacher on {date_str}. The Preacher and the Filipino "
+                 f"Preacher must be different people, so please pick someone else.\n\n",
+        )
 
     conflicts = find_conflicts(ss, service_type, date_str, name)
     if conflicts:
@@ -1863,15 +1892,45 @@ async def generate_service_period(update: Update, context: ContextTypes.DEFAULT_
     already_filled = get_already_filled(ss.worksheet(service), dates)
     counts = load_assignment_counts(ss)
     unavailable = get_unavailability(ss, service, dates)
+
+    # Filipino Translation: whoever is that Sunday's (English) Preacher can never
+    # also be the Filipino Preacher, who translates the sermon online.
+    never_by_role, soft_avoid_from_role, warnings = {}, {}, []
+    if service == "FilipinoTranslation":
+        sunday_preachers = get_role_assignments(ss, "Sunday", "Preacher", dates)
+        never_by_role = {"Filipino Preacher": {
+            d: {p} for d, p in sunday_preachers.items() if p and p != LIVE_BROADCAST
+        }}
+        unset = [d for d in dates if d.isoformat() not in sunday_preachers]
+        if unset:
+            warnings.append(
+                "ℹ️ Sunday's Preacher isn't set yet for " + ", ".join(d.strftime("%b %d") for d in unset)
+                + ", so I couldn't keep the Filipino Preacher different from the Preacher on those dates. "
+                "Set the preachers first (/set_preacher)."
+            )
+        # Someone who is the Filipino Preacher on one Sunday is avoided (not
+        # blocked) for Initial Proofreading on another — they should mainly
+        # just preach; being 2nd PR sometimes is fine, so that pairing is left
+        # to fairness alone.
+        soft_avoid_from_role = {"Initial Proofreading": "Filipino Preacher"}
+
     schedule_rows, counts = generate_simple_schedule(
-        dates, random_roles, counts, already_filled=already_filled, unavailable=unavailable
+        dates, random_roles, counts, already_filled=already_filled, unavailable=unavailable,
+        never_by_role=never_by_role, soft_avoid_from_role=soft_avoid_from_role,
     )
     append_schedule_rows(ss, service, schedule_rows, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
+    assigned = {(d, r) for d, r, _p in schedule_rows}
+    missing = [f"{r} on {d.strftime('%b %d')}" for d in dates for r in random_roles if (d.isoformat(), r) not in assigned]
+    if missing:
+        warnings.append("⚠️ Nobody could be assigned: " + ", ".join(missing) + ".")
+
     summary = format_schedule_summary(service, schedule_rows)
     note = f"\n\n(Manual-entry roles for this service — log via /log_role: {', '.join(manual_roles)})" if manual_roles else ""
     await query.message.reply_text(summary + note, parse_mode="Markdown")
+    for w in warnings:
+        await query.message.reply_text(w)
     await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
     return ConversationHandler.END
 
@@ -2503,6 +2562,45 @@ def get_cross_service_conflicts(ss, service, date_str, person):
     return [r["Role"] for r in ws.get_all_records() if r.get("Date") == date_str and r.get("Partaker") == person]
 
 
+# The English Preacher delivers the sermon; the Filipino Preacher translates it
+# online at the same time. They must be two different people on the same Sunday.
+# Unlike other double roles (which only trigger a warning), this pairing is
+# never allowed.
+FORBIDDEN_SAME_DAY = {
+    ("Sunday", "Preacher"): ("FilipinoTranslation", "Filipino Preacher"),
+    ("FilipinoTranslation", "Filipino Preacher"): ("Sunday", "Preacher"),
+}
+
+
+def forbidden_conflict(ss, service, role, date_str, person):
+    """If `person` already holds the role that must never be combined with
+    `role` on `date_str` (it lives in the other service's tab), returns that
+    role's name, otherwise None."""
+    pair = FORBIDDEN_SAME_DAY.get((service, role))
+    if not pair or not person or person == LIVE_BROADCAST:
+        return None
+    other_service, other_role = pair
+    for r in ss.worksheet(other_service).get_all_records():
+        if r.get("Date") == date_str and r.get("Role") == other_role and r.get("Partaker") == person:
+            return other_role
+    return None
+
+
+def preacher_pair_clashes(ss, dates):
+    """[(date, person)] where the same person is both Sunday's Preacher and the
+    Filipino Preacher on that date."""
+    date_set = {d if isinstance(d, str) else d.isoformat() for d in dates}
+    preachers = {r["Date"]: r["Partaker"] for r in ss.worksheet("Sunday").get_all_records()
+                 if r.get("Role") == "Preacher" and r.get("Date") in date_set}
+    out = []
+    for r in ss.worksheet("FilipinoTranslation").get_all_records():
+        person = r.get("Partaker")
+        if (r.get("Role") == "Filipino Preacher" and r.get("Date") in date_set and person
+                and person != LIVE_BROADCAST and preachers.get(r["Date"]) == person):
+            out.append((r["Date"], person))
+    return out
+
+
 def find_conflicts(ss, service, date_str, person, ignore_role=None):
     """All roles `person` already holds on `date_str` that would conflict
     with giving them one more — same-tab (covers Tech-vs-partaker and any
@@ -2603,7 +2701,7 @@ def plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b):
       unmovable - conflicts that can't be fixed automatically (Preacher/Tech/
                   hand-picked roles, roles in the other service's tab, or
                   nobody free)"""
-    plan = {"role": role, "conflicts": [], "moves": [], "unmovable": []}
+    plan = {"role": role, "conflicts": [], "moves": [], "unmovable": [], "blocked": []}
     if not partaker_a or not partaker_b or partaker_a == partaker_b:
         return plan
 
@@ -2614,6 +2712,10 @@ def plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b):
     # the person arriving on each date, and the date they arrive on
     for person, target in ((partaker_b, date_a), (partaker_a, date_b)):
         if person == LIVE_BROADCAST:
+            continue
+        clash = forbidden_conflict(ss, service, role, target, person)
+        if clash:
+            plan["blocked"].append({"person": person, "date": target, "other": clash})
             continue
         same_tab = get_person_roles_on_date(ss, service, target, person, ignore_role=role)
         cross_tab = get_cross_service_conflicts(ss, service, target, person)
@@ -2643,6 +2745,12 @@ def plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b):
 
 
 def describe_swap_plan(plan):
+    if plan["blocked"]:
+        return "\n".join(
+            f"⛔ {b['person']} is the {b['other']} on {b['date']}. The Preacher and the Filipino Preacher "
+            f"must be different people, so this swap isn't allowed."
+            for b in plan["blocked"]
+        )
     lines = ["⚠️ Double role warning:"]
     for c in plan["conflicts"]:
         lines.append(f"- {c['person']} would take {plan['role']} on {c['date']} but already has "
@@ -2675,9 +2783,13 @@ def double_booking_warnings(ss, service, changed):
     if not changed:
         return []
     touched = {(d, p) for d, _role, p in changed}
-    return [f"{d}: {p} has {' + '.join(roles)}"
-            for d, p, roles in find_double_bookings(ss, service, {d for d, _r, _p in changed})
-            if (d, p) in touched]
+    lines = [f"{d}: {p} has {' + '.join(roles)}"
+             for d, p, roles in find_double_bookings(ss, service, {d for d, _r, _p in changed})
+             if (d, p) in touched]
+    if service in ("Sunday", "FilipinoTranslation"):
+        lines += [f"{d}: {p} is both the Preacher and the Filipino Preacher (not allowed)"
+                  for d, p in preacher_pair_clashes(ss, {d for d, _r, _p in changed}) if (d, p) in touched]
+    return lines
 
 
 # --- /swap: two dates trade partakers for the same role ---
@@ -2750,7 +2862,10 @@ async def swap_select_date_b(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Swap {role}:\n{date_a}: {partaker_a}\n{date_b}: {partaker_b}\n\n"
         f"After swap: {date_a} -> {partaker_b}, {date_b} -> {partaker_a}"
     )
-    if not plan["conflicts"]:
+    if plan["blocked"]:
+        text += "\n\n" + describe_swap_plan(plan)
+        buttons = [[InlineKeyboardButton("Cancel", callback_data="no")]]
+    elif not plan["conflicts"]:
         buttons = [
             [InlineKeyboardButton("Confirm swap", callback_data="yes")],
             [InlineKeyboardButton("Cancel", callback_data="no")],
@@ -2787,6 +2902,9 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # re-check right now: the sheet may have changed since the screen was shown
     plan = plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b)
+    if plan["blocked"]:
+        await query.edit_message_text(describe_swap_plan(plan) + "\n\nNothing was changed.")
+        return ConversationHandler.END
     moves = []
     if choice == "move":
         if plan["unmovable"]:
@@ -4346,12 +4464,18 @@ async def pref_show_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = []
     if row:
         buttons.append(row)
+    # Skip the bulk button once every non-preacher date is already marked — nothing left to add.
+    can_mark_more = any(d.isoformat() not in preacher_dates and d.isoformat() not in marked for d in dates)
+    if can_mark_more:
+        buttons.append([InlineKeyboardButton("✖ I'm not available this month", callback_data="all_unavailable")])
     buttons.append([InlineKeyboardButton("I'm done", callback_data="done")])
 
     text = (
         f"Hi {name}! Tap each date you are NOT available (✖ = not available; tap again to undo). "
         f"Dates you leave alone count as available. Tap 'I'm done' when finished."
     )
+    if can_mark_more:
+        text += " Not available at all this month? Tap 'I'm not available this month' instead of every date."
     if preacher_dates:
         text += "\n🎤 = you're the Preacher that day, so you're already waived from other roles."
     await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -4372,6 +4496,23 @@ async def pref_select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"You can reopen this link anytime before the deadline to change them."
         )
         return ConversationHandler.END
+
+    if query.data == "all_unavailable":
+        if not pref_round_still_open(context):
+            await query.answer()
+            await query.edit_message_text("This preference round just closed — sorry!")
+            return ConversationHandler.END
+        await query.answer("Marking every date as not available...")
+        service = round_["Service"]
+        marked = context.user_data["pref_marked"]
+        preacher_dates = context.user_data["pref_preacher_dates"]
+        for d in context.user_data["pref_dates"]:
+            date_str = d.isoformat()
+            if date_str in preacher_dates or date_str in marked:
+                continue
+            toggle_unavailable(ss, service, date_str, name)
+            marked.add(date_str)
+        return await pref_show_dates(update, context)
 
     date_str = query.data
     if date_str in context.user_data["pref_preacher_dates"]:
