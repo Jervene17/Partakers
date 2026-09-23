@@ -2458,12 +2458,16 @@ SET_GROUP_PURPOSE = 40
 async def set_group_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     context.user_data["group_chat_id"] = chat_id
+    ss = setup_sheet()
     buttons = [
-        [InlineKeyboardButton("Service Partakers", callback_data="Service Partakers")],
+        [InlineKeyboardButton("Service Partakers (everyone)", callback_data="Service Partakers")],
         [InlineKeyboardButton("Filipino Translators", callback_data="Filipino Translators")],
-    ]
+    ] + [[InlineKeyboardButton(role, callback_data=role)] for role in role_group_purposes(ss)]
     await update.message.reply_text(
-        "Register this group for which reminders?", reply_markup=InlineKeyboardMarkup(buttons)
+        "Register this group for which reminders? Pick 'Service Partakers' for a group covering "
+        "everyone, or pick a role (e.g. Presider) if this group is only for people who do that role — "
+        "it will then also get preference-round announcements for any service with that role.",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
     return SET_GROUP_PURPOSE
 
@@ -2475,13 +2479,65 @@ async def set_group_purpose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.user_data["group_chat_id"]
     ss = setup_sheet()
     set_group_chat_id(ss, purpose, chat_id)
-    await query.edit_message_text(f"This group is now registered for '{purpose}' reminders.")
+    if purpose in ("Service Partakers", "Filipino Translators"):
+        await query.edit_message_text(f"This group is now registered for '{purpose}' reminders.")
+    else:
+        await query.edit_message_text(
+            f"This group is now registered for the '{purpose}' role. It will get preference-round "
+            f"announcements and close notices for any service that has a '{purpose}' role, alongside "
+            f"the Service Partakers group."
+        )
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
 # #5 Adjustments: swaps, substitutions, special requests
 # ---------------------------------------------------------------------------
+
+# --- Multiple group chats per service (e.g. a dedicated Presiders group,
+# alongside the general Service Partakers group) ---
+#
+# A group is registered under a "Purpose": "Service Partakers" (everyone),
+# "Filipino Translators" (that service's own group), or a role name (e.g.
+# "Presider") for a group dedicated to people who do that one role. A
+# preference round for a service notifies every group whose purpose matches:
+# Service Partakers, plus any role of that service that has its own group.
+# Filipino Translation keeps its single dedicated group instead (unchanged).
+
+def role_group_purposes(ss):
+    """Every role name across every service that actually collects preferences
+    (built-in and custom, excluding Sun Stop Sundays — no round is ever opened
+    for it — and Filipino Translation, which uses its own single group) —
+    these are the extra "Purpose" options /set_group_chat can offer, one per
+    role, e.g. "Presider", "Representative Prayer"."""
+    services = [s for s in get_all_schedule_tabs(ss) if s not in ("SunStopSundays", "FilipinoTranslation")]
+    return sorted({role for service in services for role in get_random_roles_for_service(ss, service)})
+
+
+def collect_round_group_chat_ids(ss, service):
+    """Every distinct, registered chat id that should hear about a preference
+    round (or its close) for `service`, in a stable order: the general
+    'Service Partakers' group, plus any group registered for one of that
+    service's randomly-picked roles (e.g. a dedicated Presiders group).
+    Filipino Translation uses only its own 'Filipino Translators' group."""
+    if service == "FilipinoTranslation":
+        purposes = ["Filipino Translators"]
+    else:
+        purposes = ["Service Partakers"] + list(get_random_roles_for_service(ss, service).keys())
+    seen, ids = set(), []
+    for purpose in purposes:
+        chat_id = get_group_chat_id(ss, purpose)
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            ids.append(chat_id)
+    return ids
+
+
+def split_chat_ids(raw):
+    """Parses a PreferenceRounds.GroupChatID cell back into a list of chat ids.
+    Works whether it holds one id (older rounds) or several, comma-separated."""
+    return [c.strip() for c in str(raw or "").split(",") if c.strip()]
+
 
 def get_role_pool(ss, service_type, role):
     """Eligible list for any role, built-in or custom, random or manual.
@@ -4138,8 +4194,8 @@ async def do_close_round(context, round_id):
             await context.bot.send_message(chat_id=partaker_chat_id, text=text, parse_mode="Markdown")
         return
 
-    chat_id = round_.get("GroupChatID") or get_group_chat_id(ss, "Service Partakers")
-    if chat_id:
+    chat_ids = split_chat_ids(round_.get("GroupChatID")) or collect_round_group_chat_ids(ss, service)
+    if chat_ids:
         text = (
             f"⏰ Preference collection for {service} — {month_label} has closed.\n\n"
             f"The schedule can now be generated — nobody will be assigned on a date they marked as "
@@ -4147,7 +4203,8 @@ async def do_close_round(context, round_id):
             f"For changes after this point, use /cancel_role, /swap, /substitute or /special_request "
             f"(please ask someone first, and submit changes in advance)."
         )
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        for chat_id in chat_ids:
+            await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def close_preference_round_job(context: ContextTypes.DEFAULT_TYPE):
@@ -4249,12 +4306,18 @@ async def open_pref_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, d
     year, month = context.user_data["pref_year"], context.user_data["pref_month"]
     reply = update.callback_query.edit_message_text if is_callback else update.message.reply_text
 
-    chat_id = get_group_chat_id(ss, "Service Partakers")
-    if not chat_id:
-        await reply("No 'Service Partakers' group is registered yet — run /set_group_chat in that group first.")
+    # Filipino Translation is announced only to its own Filipino Translators
+    # group, matching how its finished schedule and Friday reminder already
+    # work. Every other service notifies the Service Partakers group PLUS any
+    # group registered for one of that service's roles (e.g. a Presiders group).
+    chat_ids = collect_round_group_chat_ids(ss, service)
+    if not chat_ids:
+        label = "Filipino Translators" if service == "FilipinoTranslation" else \
+            "Service Partakers (or a role group, e.g. Presider)"
+        await reply(f"No {label} group is registered yet — run /set_group_chat in that group first.")
         return ConversationHandler.END
 
-    round_id = create_preference_round(ss, service, year, month, deadline, chat_id)
+    round_id = create_preference_round(ss, service, year, month, deadline, ",".join(str(c) for c in chat_ids))
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     deep_link = f"https://t.me/{BOT_USERNAME}?start=pref_{round_id}"
     # HTML (not Markdown) so the underscores in /cancel_role etc. are safe
@@ -4265,9 +4328,10 @@ async def open_pref_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         f"you're treated as available on every date.\n\n"
         f'<a href="{html.escape(deep_link, quote=True)}">Set my preferences</a>'
     )
-    await context.bot.send_message(
-        chat_id=chat_id, text=announcement, parse_mode="HTML", disable_web_page_preview=True
-    )
+    for chat_id in chat_ids:
+        await context.bot.send_message(
+            chat_id=chat_id, text=announcement, parse_mode="HTML", disable_web_page_preview=True
+        )
     context.job_queue.run_once(
         close_preference_round_job, when=deadline, data={"round_id": round_id}, name=f"close_{round_id}"
     )
