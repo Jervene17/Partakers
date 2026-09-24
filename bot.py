@@ -188,6 +188,12 @@ BOT_TOKEN = os.environ["SERVICE_PARTAKER_BOT_TOKEN"]
 SPREADSHEET_ID = os.environ["SERVICE_PARTAKER_SHEET_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]  # path or inline JSON, match your other bots' setup
 BOT_USERNAME = os.environ["SERVICE_PARTAKER_BOT_USERNAME"]  # no @, e.g. "MyChurchSchedulerBot" — used to build deep links
+# Telegram shows bot usernames as "@MyBot" inside the app, so it's an easy typo
+# to paste that into the Railway variable with the @ still attached. A deep
+# link with a literal @ in it (t.me/@MyBot?start=...) is invalid and Telegram
+# falls back to a generic "open Telegram" page instead of the bot — so strip
+# any @ (and stray whitespace) here, defensively, regardless of how it's set.
+BOT_USERNAME = BOT_USERNAME.strip().lstrip("@")
 # Link opened by the "📖 Guide to the bot" menu button. Override with a GUIDE_URL
 # environment variable (e.g. if you host the guide elsewhere); set it to an empty
 # value to hide the button.
@@ -4326,7 +4332,7 @@ async def open_pref_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         f"{html.escape(PARTAKER_PREFERENCE_NOTE)}\n{html.escape(PARTAKER_COMMANDS_HINT)}\n\n"
         f"Deadline: <b>{deadline.strftime('%B %d, %Y %I:%M %p')}</b>. If you don't respond by then, "
         f"you're treated as available on every date.\n\n"
-        f'<a href="{html.escape(deep_link, quote=True)}">Set my preferences</a>'
+        f'<a href="{html.escape(deep_link, quote=True)}">Set my availability</a>'
     )
     for chat_id in chat_ids:
         await context.bot.send_message(
