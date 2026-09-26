@@ -272,6 +272,7 @@
       <li><p><b>Tap the link.</b> It opens a private chat with the bot.</p></li>
       <li><p><b>Tap your name.</b></p></li>
       <li><p><b>Tap every date you can NOT do.</b> It shows a ✖. Tap it again to undo.</p></li>
+      <li><p>Not available for the <b>whole month</b>? Tap <span class="tg">✖ I'm not available this month</span> instead of tapping every date one by one.</p></li>
       <li><p><b>Tap <span class="tg">I'm done</span>.</b> Your dates are saved.</p></li>
     </ol>
     <div class="ok">
@@ -339,7 +340,7 @@
     <details>
       <summary><b>See a service's schedule</b><small>Nearest date, this week (Predawn) or this month.</small></summary>
       <div class="body">
-        <p>Tap <span class="tg">🔎 Pull schedule</span>, pick the service, then pick the period.</p>
+        <p>Tap <span class="tg">🔎 Pull schedule</span>, pick the service, then pick the period. Tap <span class="tg">📅 Pick a month</span> to see any month, past or future, not just the nearest date or the current month.</p>
       </div>
     </details>
     <details>
@@ -390,7 +391,13 @@
     <details>
       <summary><b>Register the groups</b><small>So the bot knows where to post announcements and reminders.</small></summary>
       <div class="body">
-        <p>Open each Telegram group, send <code class="cmd">/set_group_chat</code> there, and choose <b>Service Partakers</b> or <b>Filipino Translators</b>. Do this once per group. Preference announcements and reminders won't work until it's done.</p>
+        <p>Open each Telegram group, send <code class="cmd">/set_group_chat</code> there, and pick what it's for. Do this once per group. Preference announcements and reminders won't work until it's done.</p>
+        <ul>
+          <li><b>Service Partakers:</b> a general group for everyone, used for most announcements.</li>
+          <li><b>Filipino Translators:</b> the Filipino Translation team's own group.</li>
+          <li><b>A role, such as Presider, Representative Prayer or Praise Leader:</b> for a group dedicated to just that role, like "LGC Presiders". When you open a preference round for a service, every group registered for one of that service's roles gets the announcement too, alongside Service Partakers. Wednesday has no Praise Leader role right now, so a Praise Leader group is only messaged for Sunday.</li>
+        </ul>
+        <p>A group can only hold one purpose. Register as many role groups as you like.</p>
       </div>
     </details>
     <details>
@@ -471,6 +478,8 @@
         </ol>
         <p>It avoids dates people marked as unavailable. Anything already filled in is kept, so running it twice never creates doubles. If someone had to be placed on a date they marked, the bot warns you.</p>
         <p>Pick <b>Filipino Translation</b> before Sunday, so the Filipino Preacher isn't also given Presider that day.</p>
+        <p>The bot also tries to keep the <b>Filipino Preacher</b> mainly just preaching — it avoids also giving them Initial Proofreading on another Sunday that month, though 2nd PR sometimes is fine.</p>
+        <p>The <b>Filipino Preacher</b> translates the sermon online while the Preacher speaks in English, so they are always two different people. The bot will never make the Sunday Preacher the Filipino Preacher, whether it is generating, setting a preacher, or swapping. If you type it in by hand in the Dashboard or a bulk upload, the bot warns you.</p>
       </div>
     </details>
 
