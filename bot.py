@@ -2171,7 +2171,7 @@ def format_person_month_summary(name, results):
 
 # --- /pull_schedule: per-service lookup (Nearest / This week / This month) ---
 
-PULL_SELECT_SERVICE, PULL_SELECT_PERIOD = range(30, 32)
+PULL_SELECT_SERVICE, PULL_SELECT_PERIOD, PULL_PICK_MONTH = range(30, 33)
 
 
 async def pull_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2193,6 +2193,7 @@ async def pull_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE
     if service == "Predawn":
         buttons.append([InlineKeyboardButton("This week", callback_data="week")])
     buttons.append([InlineKeyboardButton("This month", callback_data="month")])
+    buttons.append([InlineKeyboardButton("📅 Pick a month", callback_data="pick_month")])
 
     await query.edit_message_text(f"{service} — which period?", reply_markup=InlineKeyboardMarkup(buttons))
     return PULL_SELECT_PERIOD
@@ -2201,6 +2202,12 @@ async def pull_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def pull_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "pick_month":
+        service = context.user_data["pull_service"]
+        await query.edit_message_text(f"{service} — which month?", reply_markup=month_keyboard())
+        return PULL_PICK_MONTH
+
     service = context.user_data["pull_service"]
     ss = context.user_data["pull_ss"]
     ws = ss.worksheet(service)
@@ -2222,6 +2229,25 @@ async def pull_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     summary = format_schedule_summary(service, records_to_rows(rows))
+    await query.edit_message_text(summary, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+async def pull_pick_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    year, month = map(int, query.data.split("-"))
+    service = context.user_data["pull_service"]
+    ss = context.user_data["pull_ss"]
+    records = ss.worksheet(service).get_all_records()
+    rows = rows_in_month(records, year, month)
+
+    month_label = dt.date(year, month, 1).strftime("%B %Y")
+    if not rows:
+        await query.edit_message_text(f"No {service} schedule found for {month_label}.")
+        return ConversationHandler.END
+
+    summary = format_schedule_summary(f"{service} — {month_label}", records_to_rows(rows))
     await query.edit_message_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -4990,6 +5016,7 @@ def build_app():
         states={
             PULL_SELECT_SERVICE: [CallbackQueryHandler(pull_select_service)],
             PULL_SELECT_PERIOD: [CallbackQueryHandler(pull_select_period)],
+            PULL_PICK_MONTH: [CallbackQueryHandler(pull_pick_month)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
