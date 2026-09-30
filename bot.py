@@ -986,6 +986,33 @@ def format_schedule_summary(service_type, schedule_rows):
         lines.append("")
     return "\n".join(lines).strip()
 
+def add_filipino_preacher_rows(ss, service_type, rows):
+    """For Sunday summaries only: inserts a 'Filipino Preacher' line under each
+    date's Preacher, read from the FilipinoTranslation tab. rows is a list of
+    (date_str, role, partaker) tuples; returns a new list. Dates with no
+    Filipino Preacher set yet are left as-is."""
+    if service_type != "Sunday" or not rows:
+        return rows
+
+    date_strs = {d for d, _r, _p in rows}
+    fil = {}
+    for r in ss.worksheet("FilipinoTranslation").get_all_records():
+        if r.get("Role") == "Filipino Preacher" and r.get("Date") in date_strs and r.get("Partaker"):
+            fil[r["Date"]] = r["Partaker"]
+    if not fil:
+        return rows
+
+    out, added = [], set()
+    for d, role, person in rows:
+        out.append((d, role, person))
+        if role == "Preacher" and d in fil and d not in added:
+            out.append((d, "Filipino Preacher", fil[d]))
+            added.add(d)
+    # dates that have no Preacher row: append at the end so it still shows
+    for d, person in fil.items():
+        if d not in added:
+            out.append((d, "Filipino Preacher", person))
+    return out
 
 # ---------------------------------------------------------------------------
 # Telegram bot — "Generate Schedule" flow (Sunday/Wednesday only, Phase 1)
@@ -1269,7 +1296,9 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_schedule_rows(ss, service_type, schedule_rows, skip_preacher_rows=True, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
-    summary = format_schedule_summary(service_type, schedule_rows)
+    summary = format_schedule_summary(
+        service_type, add_filipino_preacher_rows(ss, service_type, schedule_rows)
+    )
     await query.message.reply_text(summary, parse_mode="Markdown")
     await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
     if service_type == "Sunday":
@@ -2312,7 +2341,9 @@ async def pull_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(f"No {service} schedule found for that period.")
         return ConversationHandler.END
 
-    summary = format_schedule_summary(service, records_to_rows(rows))
+    summary = format_schedule_summary(
+        service, add_filipino_preacher_rows(ss, service, records_to_rows(rows))
+    )
     await query.edit_message_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -2331,9 +2362,15 @@ async def pull_pick_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"No {service} schedule found for {month_label}.")
         return ConversationHandler.END
 
-    summary = format_schedule_summary(f"{service} — {month_label}", records_to_rows(rows))
+    summary = format_schedule_summary(
+        f"{service} — {month_label}",
+        add_filipino_preacher_rows(ss, service, records_to_rows(rows)),
+    )
     await query.edit_message_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
+
+
+# --- /pull_person
 
 
 # --- /pull_person: per-individual or per-department lookup ---
