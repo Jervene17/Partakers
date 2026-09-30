@@ -731,8 +731,7 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                       display, but is NOT re-written to the sheet (it's
                       already there) — see append_schedule_rows.
     filipino_preacher_assignments: {date_str: partaker}, Sunday only. That
-                      person is hard-excluded from Presider and soft-excluded
-                      (avoid unless inevitable) from every other role.
+                      person is excluded from every Sunday role that date.
     roles: {role: eligible_list}; defaults to the hardcoded ROLE_SETS but
                       callers should pass get_random_roles_for_service(ss,
                       service_type) so roster-management edits (#6) apply.
@@ -749,6 +748,14 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                       they can't do. Hard-excluded from every role that date
                       (only ignored if that would leave a role with nobody).
 
+    Sunday-only rules, applied during generation only (Preachers are exempt):
+      * nobody gets the same role twice in a month (hard, via `never`)
+      * a multi-role person (eligible for 2+ of the generated roles) with no
+        unavailable dates that month is kept to at most (Sundays - 1) days of
+        partaker roles (soft: only broken if inevitable)
+      * the Filipino Preacher is excluded from every Sunday role that date;
+        Filipino proofreaders (Initial Proofreading / 2nd PR) are NOT restricted
+
     Returns: (list of (date_str, role, partaker), updated counts dict)
     """
     unavailable = unavailable or {}
@@ -756,10 +763,33 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
     weekday = SERVICE_WEEKDAY[service_type]
     filipino_preacher_assignments = filipino_preacher_assignments or {}
     already_filled = already_filled or {}
+    sunday = service_type == "Sunday"
     schedule_rows = []
 
     for year, month in year_month_list:
-        for d in dates_in_month(year, month, weekday):
+        month_dates = dates_in_month(year, month, weekday)
+        month_strs = {d.isoformat() for d in month_dates}
+
+        role_done = defaultdict(set)   # role -> people who already hold it this month
+        worked = defaultdict(set)      # person -> dates they already have a partaker role
+        capped = set()
+        max_days = len(month_dates) - 1
+        if sunday:
+            for (fd, frole), fperson in already_filled.items():
+                if fd in month_strs:
+                    role_done[frole].add(fperson)
+                    worked[fperson].add(fd)
+            role_count = defaultdict(int)
+            for eligible in roles.values():
+                for p in set(eligible):
+                    role_count[p] += 1
+            if max_days >= 1:
+                capped = {
+                    p for p, c in role_count.items()
+                    if c >= 2 and not any(p in unavailable.get(ds, ()) for ds in month_strs)
+                }
+
+        for d in month_dates:
             date_str = d.isoformat()
             preacher = preacher_assignments[date_str]  # precondition: must exist
             schedule_rows.append((date_str, "Preacher", preacher))
@@ -776,14 +806,30 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
                 if (date_str, role) in already_filled:
                     schedule_rows.append((date_str, role, already_filled[(date_str, role)]))
                     continue
-                hard_exclude = ({fil_preacher} if (role == "Presider" and fil_preacher) else set()) \
-                    | set(unavailable.get(date_str, ()))
-                soft_exclude = {fil_preacher} if (fil_preacher and role != "Presider") else set()
-                person = pick_partaker(eligible, counts, taken_today, hard_exclude, soft_exclude)
+
+                hard_exclude = set(unavailable.get(date_str, ()))
+                soft_exclude = set()
+                never = set()
+                if sunday:
+                    never = set(role_done[role])
+                    if fil_preacher:
+                        never.add(fil_preacher)
+                    soft_exclude = {p for p in capped
+                                    if len(worked[p]) >= max_days and date_str not in worked[p]}
+                else:
+                    if role == "Presider" and fil_preacher:
+                        hard_exclude.add(fil_preacher)
+                    if fil_preacher and role != "Presider":
+                        soft_exclude = {fil_preacher}
+
+                person = pick_partaker(eligible, counts, taken_today, hard_exclude, soft_exclude, never)
                 if person is None:
                     continue  # nobody eligible for this role — leave it unassigned
                 taken_today.add(person)
                 counts[person] += 1
+                if sunday:
+                    role_done[role].add(person)
+                    worked[person].add(date_str)
                 schedule_rows.append((date_str, role, person))
 
     return schedule_rows, counts
@@ -889,6 +935,40 @@ async def warn_if_unavailable_scheduled(message, rows, unavailable):
         "⚠️ Heads up — these people are scheduled on a date they marked as unavailable "
         "(no other eligible partaker was free, or the slot was already filled):\n" + lines
     )
+
+
+async def warn_sunday_rules(message, rows, roles, unavailable, dates):
+    """Reports Sunday slots left empty by the no-repeat-role rule, and
+    multi-role partakers who ended up with no Sunday off. Preacher rows
+    are ignored (Preachers are exempt from these rules)."""
+    assigned = {(d, r) for d, r, _p in rows}
+    empty = [f"{r} on {d.strftime('%b %d')}" for d in dates for r in roles
+             if (d.isoformat(), r) not in assigned]
+    if empty:
+        await message.reply_text(
+            "⚠️ Left empty (everyone eligible already had that role this month, or was unavailable): "
+            + ", ".join(empty) + ".\nFill them with /substitute or /log_role."
+        )
+
+    date_strs = [d.isoformat() for d in dates]
+    role_count = defaultdict(int)
+    for eligible in roles.values():
+        for p in set(eligible):
+            role_count[p] += 1
+    worked = defaultdict(set)
+    for d, role, p in rows:
+        if role != "Preacher":
+            worked[p].add(d)
+    no_off = sorted(
+        p for p, c in role_count.items()
+        if c >= 2 and p != LIVE_BROADCAST and len(dates) >= 2
+        and not any(p in unavailable.get(ds, ()) for ds in date_strs)
+        and len(worked[p]) >= len(dates)
+    )
+    if no_off:
+        await message.reply_text(
+            "⚠️ No Sunday off this month (nobody else could cover): " + ", ".join(no_off)
+        )
 
 
 def format_schedule_summary(service_type, schedule_rows):
@@ -1162,8 +1242,9 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Generating schedule...")
 
     # Filipino Preacher exclusions only apply to Sunday: whoever is the
-    # Filipino Preacher that date can't be Presider (hard) and is avoided
-    # for other roles when possible (soft). Read from the FilipinoTranslation tab.
+    # Filipino Preacher that date can't take any Sunday role that date
+    # (Filipino proofreaders are NOT restricted). Read from the
+    # FilipinoTranslation tab.
     filipino_preacher_assignments = (
         get_role_assignments(ss, "FilipinoTranslation", "Filipino Preacher", dates)
         if service_type == "Sunday" else {}
@@ -1177,11 +1258,12 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Dates partakers marked as unavailable in the preference round
     unavailable = get_unavailability(ss, service_type, dates)
 
+    random_roles = get_random_roles_for_service(ss, service_type)
+
     counts = load_assignment_counts(ss)
     schedule_rows, counts = generate_schedule(
         service_type, [(year, month)], counts, preacher_assignments, filipino_preacher_assignments,
-        roles=get_random_roles_for_service(ss, service_type), already_filled=already_filled,
-        unavailable=unavailable,
+        roles=random_roles, already_filled=already_filled, unavailable=unavailable,
     )
 
     append_schedule_rows(ss, service_type, schedule_rows, skip_preacher_rows=True, skip_keys=already_filled)
@@ -1190,6 +1272,8 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = format_schedule_summary(service_type, schedule_rows)
     await query.message.reply_text(summary, parse_mode="Markdown")
     await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
+    if service_type == "Sunday":
+        await warn_sunday_rules(query.message, schedule_rows, random_roles, unavailable, dates)
     return ConversationHandler.END
 
 
@@ -4206,7 +4290,7 @@ async def do_close_round(context, round_id):
     month_label = dt.date(year, month, 1).strftime("%B %Y")
 
     if service == "FilipinoTranslation":
-        # Send the translation schedule-so-far to the Filipino Translators
+        # Send the translation schedule-so-far to the Filipino Translation
         # group, then tell the Service Partakers group Sunday preferences
         # can now be opened.
         fil_chat_id = round_.get("GroupChatID") or get_group_chat_id(ss, "Filipino Translators")
