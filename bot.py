@@ -3743,7 +3743,7 @@ async def do_substitute(query, context, ss, service, role, date_str, new_partake
     log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, adj_type)
 
     random_roles = get_random_roles_for_service(ss, service)
-        if role in random_roles and new_partaker not in PLACEHOLDER_PARTAKERS:
+    if role in random_roles and new_partaker not in PLACEHOLDER_PARTAKERS:
         counts = load_assignment_counts(ss)
         if old_partaker not in PLACEHOLDER_PARTAKERS:
             counts[old_partaker] = max(0, counts[old_partaker] - 1)
