@@ -1105,6 +1105,22 @@ def add_filipino_preacher_rows(ss, service_type, rows):
     return out
 
 
+def add_tech_rows(ss, service_type, rows):
+    """Include already logged Tech assignments in generated schedule summaries."""
+    tech_roles = set(TECH_ROLES_BY_SERVICE.get(service_type, {}))
+    if not tech_roles or not rows:
+        return rows
+    date_strs = {date_str for date_str, _role, _person in rows}
+    present = set(rows)
+    out = list(rows)
+    for r in ss.worksheet(service_type).get_all_records():
+        item = (r.get("Date"), r.get("Role"), r.get("Partaker"))
+        if item[0] in date_strs and item[1] in tech_roles and item[2] and item not in present:
+            out.append(item)
+            present.add(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Telegram bot — "Generate Schedule" flow (Sunday/Wednesday only, Phase 1)
 # ---------------------------------------------------------------------------
@@ -1399,7 +1415,9 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_assignment_counts(ss, counts)
 
     summary = format_schedule_summary(
-        service_type, add_filipino_preacher_rows(ss, service_type, schedule_rows)
+        service_type, add_tech_rows(
+            ss, service_type, add_filipino_preacher_rows(ss, service_type, schedule_rows)
+        )
     )
     await query.message.reply_text(summary, parse_mode="Markdown")
     await warn_if_unavailable_scheduled(query.message, schedule_rows, unavailable)
@@ -1631,7 +1649,9 @@ async def select_sunstop_month(update: Update, context: ContextTypes.DEFAULT_TYP
     append_schedule_rows(ss, "SunStopSundays", schedule_rows, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
-    summary = format_schedule_summary("Sun Stop Sundays", schedule_rows)
+    summary = format_schedule_summary(
+        "Sun Stop Sundays", add_tech_rows(ss, "SunStopSundays", schedule_rows)
+    )
     await query.message.reply_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -2009,7 +2029,7 @@ async def add_service_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         append_schedule_rows(ss, service, rows, skip_keys=already_filled)
         save_assignment_counts(ss, counts)
-        summary = format_schedule_summary(service, rows)
+        summary = format_schedule_summary(service, add_tech_rows(ss, service, rows))
         manual_roles = [r for r, c in configs[service]["roles"].items() if c["mode"] == "manual"]
         note = (f"\n\n(Manual-entry roles for this service — log via /log_role: {', '.join(manual_roles)})"
                 if manual_roles else "")
@@ -2189,7 +2209,7 @@ async def generate_service_period(update: Update, context: ContextTypes.DEFAULT_
     if missing:
         warnings.append("⚠️ Nobody could be assigned: " + ", ".join(missing) + ".")
 
-    summary = format_schedule_summary(service, schedule_rows)
+    summary = format_schedule_summary(service, add_tech_rows(ss, service, schedule_rows))
     note = f"\n\n(Manual-entry roles for this service — log via /log_role: {', '.join(manual_roles)})" if manual_roles else ""
     await query.message.reply_text(summary + note, parse_mode="Markdown")
     for w in warnings:
