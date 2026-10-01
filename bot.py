@@ -334,6 +334,7 @@ SHEET_TABS = [
     "Unavailability",
     "PostedSummaries",
     "ScheduleFeedback",
+    "Tech",
 ]
 
 TAB_HEADERS = {
@@ -363,6 +364,7 @@ TAB_HEADERS = {
     # can be edited in place whenever the schedule changes.
     "PostedSummaries": ["Service", "Year", "Month", "ChatID", "MessageID"],
     "ScheduleFeedback": ["Service", "Year", "Month", "ChatID", "UserID", "UserName", "Response", "Details", "Timestamp"],
+    "Tech": ["Service", "Date", "Role", "Partaker", "Status"],
 }
 
 DASHBOARD_MONTHS_AHEAD = 3  # how many upcoming months each dashboard tab shows
@@ -466,6 +468,10 @@ def setup_sheet():
             builtin_rows.append(["FilipinoTranslation", "month", role, ", ".join(eligible), "random"])
     if builtin_rows:
         config_ws.append_rows(builtin_rows)
+
+    # Keep a dedicated, filterable Tech log in sync with the legacy service
+    # tabs. This also backfills Tech rows logged before the Tech tab existed.
+    sync_tech_log(ss)
 
     _setup_ss = ss
     _setup_checked_at = time.time()
@@ -629,6 +635,10 @@ def write_role_assignments(ss, service_type, role, assignments):
     directly — used for Preacher and for manual Tech logging."""
     ws = ss.worksheet(service_type)
     ws.append_rows([[date_str, role, partaker, "scheduled"] for date_str, partaker in assignments])
+    if role in TECH_ROLES_BY_SERVICE.get(service_type, {}):
+        tech_ws = ss.worksheet("Tech")
+        tech_ws.append_rows([[service_type, date_str, role, partaker, "scheduled"]
+                             for date_str, partaker in assignments])
 
 
 def get_preacher_assignments(ss, service_type, dates):
@@ -1120,7 +1130,10 @@ def add_tech_rows(ss, service_type, rows):
     # Tech may have been logged by another bot instance, so bypass the short
     # read cache before building the summary.
     clear_read_cache()
-    for r in ss.worksheet(service_type).get_all_records():
+    sync_tech_log(ss)
+    for r in ss.worksheet("Tech").get_all_records():
+        if r.get("Service") != service_type:
+            continue
         item = (r.get("Date"), r.get("Role"), r.get("Partaker"))
         role_name = str(item[1] or "").strip()
         is_tech = role_name in tech_roles or "tech" in role_name.casefold()
@@ -1128,6 +1141,27 @@ def add_tech_rows(ss, service_type, rows):
             out.append(item)
             present.add(item)
     return out
+
+
+def sync_tech_log(ss):
+    """Append legacy service-tab Tech entries missing from the central Tech tab."""
+    tech_ws = ss.worksheet("Tech")
+    logged = {(r.get("Service"), r.get("Date"), r.get("Role"), r.get("Partaker"))
+              for r in tech_ws.get_all_records()}
+    missing = []
+    for service, tech_roles in TECH_ROLES_BY_SERVICE.items():
+        try:
+            records = ss.worksheet(service).get_all_records()
+        except Exception:
+            continue
+        for row in records:
+            role, partaker, date_str = row.get("Role"), row.get("Partaker"), row.get("Date")
+            key = (service, date_str, role, partaker)
+            if role in tech_roles and partaker and key not in logged:
+                missing.append([service, date_str, role, partaker, row.get("Status") or "scheduled"])
+                logged.add(key)
+    if missing:
+        tech_ws.append_rows(missing)
 
 
 # ---------------------------------------------------------------------------
@@ -2525,7 +2559,9 @@ async def pull_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     summary = format_schedule_summary(
-        service, add_filipino_preacher_rows(ss, service, records_to_rows(rows))
+        service, add_tech_rows(
+            ss, service, add_filipino_preacher_rows(ss, service, records_to_rows(rows))
+        )
     )
     await query.edit_message_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
@@ -2547,7 +2583,9 @@ async def pull_pick_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     summary = format_schedule_summary(
         f"{service} — {month_label}",
-        add_filipino_preacher_rows(ss, service, records_to_rows(rows)),
+        add_tech_rows(
+            ss, service, add_filipino_preacher_rows(ss, service, records_to_rows(rows))
+        ),
     )
     await query.edit_message_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
@@ -3120,6 +3158,7 @@ def build_group_summary(ss, service, year, month):
         return None
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     rows = add_filipino_preacher_rows(ss, service, records_to_rows(rows))
+    rows = add_tech_rows(ss, service, rows)
     return format_schedule_summary(f"{service} — {month_label}", rows)
 
 
