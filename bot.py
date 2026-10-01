@@ -1112,14 +1112,19 @@ def add_filipino_preacher_rows(ss, service_type, rows):
 def add_tech_rows(ss, service_type, rows):
     """Include already logged Tech assignments in generated schedule summaries."""
     tech_roles = set(TECH_ROLES_BY_SERVICE.get(service_type, {}))
-    if not tech_roles or not rows:
+    if not rows:
         return rows
     date_strs = {date_str for date_str, _role, _person in rows}
     present = set(rows)
     out = list(rows)
+    # Tech may have been logged by another bot instance, so bypass the short
+    # read cache before building the summary.
+    clear_read_cache()
     for r in ss.worksheet(service_type).get_all_records():
         item = (r.get("Date"), r.get("Role"), r.get("Partaker"))
-        if item[0] in date_strs and item[1] in tech_roles and item[2] and item not in present:
+        role_name = str(item[1] or "").strip()
+        is_tech = role_name in tech_roles or "tech" in role_name.casefold()
+        if item[0] in date_strs and is_tech and item[2] and item not in present:
             out.append(item)
             present.add(item)
     return out
