@@ -1712,6 +1712,17 @@ async def log_tech_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return TECH_SELECT_SERVICE
 
 
+async def tech_menu_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Restart /log_tech if its menu button is tapped during an old Tech flow."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    return await log_tech_start(_ButtonAsCommand(update), context)
+
+
 async def tech_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5919,11 +5930,26 @@ def build_app():
     tech_conv = ConversationHandler(
         entry_points=[CommandHandler("log_tech", log_tech_start), menu_entry("log_tech", log_tech_start)],
         states={
-            TECH_SELECT_SERVICE: [CallbackQueryHandler(tech_select_service)],
-            TECH_SELECT_ROLE: [CallbackQueryHandler(tech_select_role)],
-            TECH_SELECT_PERIOD: [CallbackQueryHandler(tech_select_period)],
-            TECH_PICK: [CallbackQueryHandler(tech_pick)],
-            TECH_CONFIRM_CONFLICT: [CallbackQueryHandler(tech_confirm_conflict)],
+            TECH_SELECT_SERVICE: [
+                CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
+                CallbackQueryHandler(tech_select_service),
+            ],
+            TECH_SELECT_ROLE: [
+                CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
+                CallbackQueryHandler(tech_select_role),
+            ],
+            TECH_SELECT_PERIOD: [
+                CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
+                CallbackQueryHandler(tech_select_period),
+            ],
+            TECH_PICK: [
+                CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
+                CallbackQueryHandler(tech_pick),
+            ],
+            TECH_CONFIRM_CONFLICT: [
+                CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
+                CallbackQueryHandler(tech_confirm_conflict),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
