@@ -1691,12 +1691,21 @@ async def tech_ask_next_date(query, context: ContextTypes.DEFAULT_TYPE):
     service = context.user_data["tech_service"]
     role = context.user_data["tech_role"]
     ss = context.user_data["tech_ss"]
-    eligible = get_role_pool(ss, service, role)
+    date_str = d.isoformat()
+    selected = {name for assigned_date, name in context.user_data["tech_new"] if assigned_date == date_str}
+    eligible = [name for name in get_role_pool(ss, service, role) if name not in selected]
     buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in eligible]
+    if selected:
+        buttons.append([InlineKeyboardButton("Done with this date", callback_data="tech_done")])
     # No Live Broadcast option here — Tech stays blank until someone actually
     # submits their own schedule, never auto-filled.
+    prompt = f"{role} for {d.strftime('%B %d, %Y')}?"
+    if selected:
+        prompt += "\nSelected: " + ", ".join(sorted(selected)) + "\nChoose another Tech or finish this date."
+    elif not eligible:
+        prompt += "\nNo eligible Techs are available."
     await query.edit_message_text(
-        f"{role} for {d.strftime('%B %d, %Y')}?", reply_markup=InlineKeyboardMarkup(buttons)
+        prompt, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
     )
     return TECH_PICK
 
@@ -1704,6 +1713,9 @@ async def tech_ask_next_date(query, context: ContextTypes.DEFAULT_TYPE):
 async def tech_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.data == "tech_done":
+        context.user_data["tech_pending"].pop(0)
+        return await tech_ask_next_date(query, context)
     name = query.data
     d = context.user_data["tech_pending"][0]
     ss = context.user_data["tech_ss"]
@@ -1723,7 +1735,6 @@ async def tech_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return TECH_CONFIRM_CONFLICT
 
-    context.user_data["tech_pending"].pop(0)
     context.user_data["tech_new"].append((date_str, name))
     return await tech_ask_next_date(query, context)
 
@@ -1732,7 +1743,7 @@ async def tech_confirm_conflict(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     if query.data == "yes":
-        d = context.user_data["tech_pending"].pop(0)
+        d = context.user_data["tech_pending"][0]
         name = context.user_data.pop("tech_pending_name")
         context.user_data["tech_new"].append((d.isoformat(), name))
         return await tech_ask_next_date(query, context)
