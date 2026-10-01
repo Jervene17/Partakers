@@ -1381,9 +1381,13 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if service_type == "Sunday":
         await warn_sunday_rules(query.message, schedule_rows, random_roles, unavailable, dates)
 
-    # post + pin to the related groups (Sunday/Wednesday only)
-    for line in await post_or_update_summary(context, ss, service_type, year, month, create=True):
-        await query.message.reply_text(line)
+    # Nothing goes to the groups until the admin has reviewed it (Sunday/Wednesday only)
+    if service_type in POSTED_SERVICES:
+        await query.message.reply_text(
+            "👀 Please review the schedule above. Nothing has been sent to the groups yet — "
+            "post it once it looks right, or make adjustments first.",
+            reply_markup=post_confirm_markup(service_type, year, month),
+        )
     return ConversationHandler.END
 
 
@@ -3013,7 +3017,7 @@ def save_posted(ss, service, year, month, chat_id, message_id):
 
 
 async def post_or_update_summary(context, ss, service, year, month, create):
-    """create=True (after /generate): in every target group, edit the month's existing post or
+    """create=True (after the admin confirms): in every target group, edit the month's existing post or
     post + pin a new one. create=False (after an adjustment): only edit posts that already exist.
     Returns status lines for the admin."""
     if service not in POSTED_SERVICES:
@@ -3107,6 +3111,83 @@ async def refresh_all_posts(context, ss):
             await post_or_update_summary(context, ss, key[0], int(key[1]), int(key[2]), create=False)
         except Exception:
             logging.exception("Couldn't refresh a posted summary")
+
+
+# --- Review before posting: nothing reaches the groups until the admin confirms ---
+# Flow: /generate shows the summary in DM with [Post & pin] / [Adjust first] buttons. Adjusting uses the
+# normal tools (/swap, /substitute, ...); then /post_summary (or the "Review updated summary" button)
+# shows the current schedule again with the same buttons. Once a post exists, adjustments edit it
+# automatically (see refresh_posts).
+# callback_data: post:svc:<service> | post:month:<service>:<y>-<m> | post:show|yes|adjust:<service>:<y>-<m>
+
+def post_confirm_markup(service, year, month):
+    key = f"{service}:{year}-{month}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Looks good — post & pin to groups", callback_data=f"post:yes:{key}")],
+        [InlineKeyboardButton("✏️ I need to adjust first", callback_data=f"post:adjust:{key}")],
+    ])
+
+
+async def post_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = [[InlineKeyboardButton(s, callback_data=f"post:svc:{s}")] for s in POSTED_SERVICES]
+    await update.message.reply_text(
+        "Review & post a summary to the groups — which service?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def post_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    action, service = parts[1], parts[2]
+    if service not in POSTED_SERVICES:
+        await query.edit_message_text(f"{service} summaries aren't posted to groups.")
+        return
+
+    if action == "svc":
+        await query.edit_message_text(
+            f"{service} — which month?", reply_markup=month_keyboard(prefix=f"post:month:{service}:")
+        )
+        return
+
+    year, month = map(int, parts[3].split("-"))
+    month_label = dt.date(year, month, 1).strftime("%B %Y")
+    clear_read_cache()  # the admin may have just edited the sheet by hand
+    ss = setup_sheet()
+
+    if action in ("month", "show"):
+        text = build_group_summary(ss, service, year, month)
+        if not text:
+            await query.edit_message_text(f"No {service} schedule found for {month_label} yet.")
+            return
+        await query.edit_message_text(f"{service} — {month_label}: preview below.")
+        await query.message.reply_text(text, parse_mode="Markdown")
+        existing = len(get_posted(ss, service, year, month))
+        note = (f"\n\nℹ️ It's already posted in {existing} group(s) — posting again just updates those posts."
+                if existing else "")
+        await query.message.reply_text(
+            "Post this to the groups?" + note, reply_markup=post_confirm_markup(service, year, month)
+        )
+        return
+
+    if action == "adjust":
+        key = f"{service}:{year}-{month}"
+        await query.edit_message_text(
+            f"OK — nothing was posted. Make your changes with /swap, /substitute, /cancel_role, "
+            f"/special_request or /mark_broadcast (or edit the Dashboard tab and run /sync_dashboard). "
+            f"When you're ready, tap below to review the updated {service} summary.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔄 Review updated summary", callback_data=f"post:show:{key}")]]
+            ),
+        )
+        return
+
+    if action == "yes":
+        await query.edit_message_text("Posting to the groups...")
+        lines = await post_or_update_summary(context, ss, service, year, month, create=True)
+        await query.edit_message_text(
+            "\n".join(lines) or f"No {service} schedule found for {month_label} yet — nothing posted."
+        )
 
 
 # --- Double-role safety: used by /swap (and the Dashboard / CSV paths) ---
@@ -5166,6 +5247,7 @@ MENU_TITLE = "Scheduling menu — what would you like to do?"
 
 MAIN_MENU_ROWS = [
     [_menu_btn("📅 Generate schedule", "generate")],
+    [_menu_btn("📌 Review & post summary", "post_summary")],
     [_menu_btn("🎤 Set preacher", "set_preacher"), _menu_btn("🌄 Set Predawn pattern", "set_predawn_pattern")],
     [_menu_btn("🎛 Log tech", "log_tech"), _menu_btn("📝 Log a role", "log_role")],
     [_menu_btn("🔄 Adjustments ›", "adjust")],
@@ -5273,6 +5355,10 @@ def build_app():
     app.add_handler(CallbackQueryHandler(menu_nav, pattern=r"^menu:(main|adjust|prefs|more)$"))
     app.add_handler(CallbackQueryHandler(from_menu(refresh_dashboard_command), pattern=r"^menu:refresh_dashboard$"))
     app.add_handler(CallbackQueryHandler(from_menu(sync_dashboard_command), pattern=r"^menu:sync_dashboard$"))
+    # review-before-posting (registered early so an open conversation can't swallow these buttons)
+    app.add_handler(CommandHandler("post_summary", post_summary_command))
+    app.add_handler(CallbackQueryHandler(from_menu(post_summary_command), pattern=r"^menu:post_summary$"))
+    app.add_handler(CallbackQueryHandler(post_summary_callback, pattern=r"^post:"))
 
     generate_conv = ConversationHandler(
         entry_points=[CommandHandler("generate", generate_schedule_start), menu_entry("generate", generate_schedule_start)],
