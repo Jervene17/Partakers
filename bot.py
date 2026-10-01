@@ -218,6 +218,8 @@ def today_local():
 # church rather than run locally. Never part of an eligible list used by
 # random/equal-share generation — only offered as an extra manual option.
 LIVE_BROADCAST = "Live broadcast"
+TBA = "TBA"
+PLACEHOLDER_PARTAKERS = {LIVE_BROADCAST, TBA}
 
 
 def broadcast_button(service):
@@ -331,6 +333,7 @@ SHEET_TABS = [
     "PredawnPattern",
     "Unavailability",
     "PostedSummaries",
+    "ScheduleFeedback",
 ]
 
 TAB_HEADERS = {
@@ -359,6 +362,7 @@ TAB_HEADERS = {
     # Remembers which group message holds each pinned monthly summary, so it
     # can be edited in place whenever the schedule changes.
     "PostedSummaries": ["Service", "Year", "Month", "ChatID", "MessageID"],
+    "ScheduleFeedback": ["Service", "Year", "Month", "ChatID", "UserID", "UserName", "Response", "Details", "Timestamp"],
 }
 
 DASHBOARD_MONTHS_AHEAD = 3  # how many upcoming months each dashboard tab shows
@@ -1050,7 +1054,7 @@ async def warn_sunday_rules(message, rows, roles, unavailable, dates):
             assigned_n[p] += 1
     no_off = sorted(
         p for p, c in assigned_n.items()
-        if c >= SUNDAY_OFF_MIN_ASSIGNMENTS and p != LIVE_BROADCAST and len(dates) >= 2
+        if c >= SUNDAY_OFF_MIN_ASSIGNMENTS and p not in PLACEHOLDER_PARTAKERS and len(dates) >= 2
         and not any(p in unavailable.get(ds, ()) for ds in date_strs)
         and len(worked[p]) >= len(dates)
     )
@@ -2966,7 +2970,7 @@ def forbidden_conflict(ss, service, role, date_str, person):
     `role` on `date_str` (it lives in the other service's tab), returns that
     role's name, otherwise None."""
     pair = FORBIDDEN_SAME_DAY.get((service, role))
-    if not pair or not person or person == LIVE_BROADCAST:
+    if not pair or not person or person in PLACEHOLDER_PARTAKERS:
         return None
     other_service, other_role = pair
     for r in ss.worksheet(other_service).get_all_records():
@@ -2985,7 +2989,7 @@ def preacher_partaker_conflicts(ss, service, role, date_str, person):
     may hold another partaker role, and an existing partaker assignment blocks
     assigning that person as either preacher.
     """
-    if not person or person == LIVE_BROADCAST:
+    if not person or person in PLACEHOLDER_PARTAKERS:
         return []
     tabs = list(dict.fromkeys([service, "Sunday", "FilipinoTranslation"]))
     rows = []
@@ -3009,7 +3013,7 @@ def preacher_pair_clashes(ss, dates):
     for r in ss.worksheet("FilipinoTranslation").get_all_records():
         person = r.get("Partaker")
         if (r.get("Role") == "Filipino Preacher" and r.get("Date") in date_set and person
-                and person != LIVE_BROADCAST and preachers.get(r["Date"]) == person):
+                and person not in PLACEHOLDER_PARTAKERS and preachers.get(r["Date"]) == person):
             out.append((r["Date"], person))
     return out
 
@@ -3019,7 +3023,7 @@ def find_conflicts(ss, service, date_str, person, ignore_role=None):
     with giving them one more — same-tab (covers Tech-vs-partaker and any
     double-role case) plus the Sunday<->FilipinoTranslation cross-tab case.
     LIVE_BROADCAST is exempt — it's expected on every role the same date."""
-    if person == LIVE_BROADCAST:
+    if person in PLACEHOLDER_PARTAKERS:
         return []
     return get_person_roles_on_date(ss, service, date_str, person, ignore_role) + \
         get_cross_service_conflicts(ss, service, date_str, person)
@@ -3134,6 +3138,44 @@ def save_posted(ss, service, year, month, chat_id, message_id):
     ws.append_rows([[service, year, month, str(chat_id), message_id]])
 
 
+def schedule_feedback_keyboard(service, year, month, chat_id):
+    adjust_url = f"https://t.me/{BOT_USERNAME}?start=adjust_{service}_{year}_{month}_{abs(int(chat_id))}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I'm good with this schedule", callback_data=f"schedule:confirm:{service}:{year}:{month}")],
+        [InlineKeyboardButton("✏️ Adjust my schedule", url=adjust_url)],
+    ])
+
+
+def record_schedule_feedback(ss, service, year, month, chat_id, user, response, details=""):
+    ws = ss.worksheet("ScheduleFeedback")
+    user_id = str(user.id)
+    user_name = user.full_name or user.username or user_id
+    values = [service, year, month, str(chat_id or ""), user_id, user_name,
+              response, details, dt.datetime.now(CHURCH_TZ).isoformat()]
+    for i, r in enumerate(ws.get_all_records()):
+        if (r.get("Service") == service and str(r.get("Year")) == str(year)
+                and str(r.get("Month")) == str(month) and str(r.get("ChatID") or "") == str(chat_id or "")
+                and str(r.get("UserID")) == user_id):
+            ws.update(range_name=f"A{i + 2}:I{i + 2}", values=[values])
+            return
+    ws.append_row(values)
+
+
+async def schedule_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _, action, service, year, month = query.data.split(":")
+    except ValueError:
+        return
+    if action != "confirm":
+        return
+    ss = setup_sheet()
+    record_schedule_feedback(
+        ss, service, int(year), int(month), query.message.chat_id, query.from_user, "confirmed"
+    )
+    await query.answer("Thanks — your confirmation is recorded.")
+
+
 async def post_or_update_summary(context, ss, service, year, month, create):
     """create=True (after the admin confirms): in every target group, edit the month's existing post or
     post + pin a new one. create=False (after an adjustment): only edit posts that already exist.
@@ -3155,16 +3197,25 @@ async def post_or_update_summary(context, ss, service, year, month, create):
     posted = updated = 0
     problems = []
     for chat_id in targets:
+        markup = schedule_feedback_keyboard(service, year, month, chat_id)
         message_id = stored.get(str(chat_id))
         if message_id:
             try:
                 await context.bot.edit_message_text(
-                    chat_id=int(chat_id), message_id=message_id, text=text, parse_mode="Markdown"
+                    chat_id=int(chat_id), message_id=message_id, text=text, parse_mode="Markdown",
+                    reply_markup=markup,
                 )
                 updated += 1
                 continue
             except BadRequest as e:
                 if "not modified" in str(e).lower():
+                    try:
+                        await context.bot.edit_message_reply_markup(
+                            chat_id=int(chat_id), message_id=message_id, reply_markup=markup
+                        )
+                    except BadRequest as markup_error:
+                        if "not modified" not in str(markup_error).lower():
+                            raise
                     updated += 1
                     continue
                 # message was deleted / can't be edited: fall through and post a fresh one
@@ -3172,7 +3223,9 @@ async def post_or_update_summary(context, ss, service, year, month, create):
                 problems.append(f"⚠️ Couldn't update the post in group {chat_id}: {e}")
                 continue
         try:
-            msg = await context.bot.send_message(chat_id=int(chat_id), text=text, parse_mode="Markdown")
+            msg = await context.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode="Markdown", reply_markup=markup
+            )
         except TelegramError as e:
             problems.append(f"⚠️ Couldn't post to group {chat_id}: {e}")
             continue
@@ -3325,9 +3378,9 @@ def apply_reassignment(ss, service, role, date_str, new_partaker, adj_type="swap
         return None
     ws.update_cell(row_num, 3, new_partaker)
     log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, adj_type, reason)
-    if role in get_random_roles_for_service(ss, service) and new_partaker != LIVE_BROADCAST:
+    if role in get_random_roles_for_service(ss, service) and new_partaker not in PLACEHOLDER_PARTAKERS:
         counts = load_assignment_counts(ss)
-        if old_partaker and old_partaker != LIVE_BROADCAST:
+        if old_partaker and old_partaker not in PLACEHOLDER_PARTAKERS:
             counts[old_partaker] = max(0, counts[old_partaker] - 1)
         counts[new_partaker] += 1
         save_assignment_counts(ss, counts)
@@ -3354,7 +3407,7 @@ def plan_swap(ss, service, role, date_a, date_b, partaker_a, partaker_b):
 
     # the person arriving on each date, and the date they arrive on
     for person, target in ((partaker_b, date_a), (partaker_a, date_b)):
-        if person == LIVE_BROADCAST:
+        if person in PLACEHOLDER_PARTAKERS:
             continue
         clash = forbidden_conflict(ss, service, role, target, person)
         if clash:
@@ -3414,7 +3467,7 @@ def find_double_bookings(ss, service, dates):
     held = defaultdict(list)
     for r in ss.worksheet(service).get_all_records():
         person = r.get("Partaker")
-        if r.get("Date") in date_set and person and person != LIVE_BROADCAST:
+        if r.get("Date") in date_set and person and person not in PLACEHOLDER_PARTAKERS:
             held[(r["Date"], person)].append(r["Role"])
     return [(d, p, roles) for (d, p), roles in sorted(held.items()) if len(roles) > 1]
 
@@ -3659,6 +3712,8 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
     _, current = get_role_row(ws, role, date_str)
     candidates = available_replacements(ss, service, date_str, role, current)
     buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in candidates]
+    if current != TBA:
+        buttons.append([InlineKeyboardButton("TBA", callback_data=TBA)])
     if current != LIVE_BROADCAST and service != "SunStopSundays":
         buttons.extend(broadcast_button(service))
     if not buttons:
@@ -3668,7 +3723,7 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
     await query.edit_message_text(
-        f"{role} on {date_str} is currently {current}. Choose an available replacement:",
+        f"{role} on {date_str} is currently {current}. Choose an available replacement or TBA:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return SUB_NEW
@@ -3688,9 +3743,9 @@ async def do_substitute(query, context, ss, service, role, date_str, new_partake
     log_adjustment(ss, service, date_str, role, old_partaker, new_partaker, adj_type)
 
     random_roles = get_random_roles_for_service(ss, service)
-    if role in random_roles and new_partaker != LIVE_BROADCAST:
+        if role in random_roles and new_partaker not in PLACEHOLDER_PARTAKERS:
         counts = load_assignment_counts(ss)
-        if old_partaker != LIVE_BROADCAST:
+        if old_partaker not in PLACEHOLDER_PARTAKERS:
             counts[old_partaker] = max(0, counts[old_partaker] - 1)
         counts[new_partaker] += 1
         save_assignment_counts(ss, counts)
@@ -3761,7 +3816,7 @@ def upcoming_assignments(ws, name=None):
     out = []
     for r in ws.get_all_records():
         date_str, person = str(r.get("Date", "")), r.get("Partaker")
-        if len(date_str) == 10 and date_str >= today and person and person != LIVE_BROADCAST:
+        if len(date_str) == 10 and date_str >= today and person and person not in PLACEHOLDER_PARTAKERS:
             if name is None or person == name:
                 out.append((date_str, r["Role"], person))
     return sorted(out)
@@ -3782,16 +3837,36 @@ def available_replacements(ss, service, date_str, role, current):
         busy |= {r["Partaker"] for r in ss.worksheet(other).get_all_records() if r.get("Date") == date_str}
     return [
         p for p in pool
-        if p not in (current, LIVE_BROADCAST) and p not in unavailable and p not in busy
+        if p != current and p not in PLACEHOLDER_PARTAKERS and p not in unavailable and p not in busy
     ]
 
 
 async def cancel_role_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss = setup_sheet()
     context.user_data["cr_ss"] = ss
+    context.user_data["cr_scope"] = None
     buttons = [[InlineKeyboardButton(s, callback_data=s)] for s in get_all_schedule_tabs(ss)]
     await update.message.reply_text("Cancel a role — which service?", reply_markup=InlineKeyboardMarkup(buttons))
     return CANCEL_SERVICE
+
+
+async def cancel_role_start_for_service(update: Update, context: ContextTypes.DEFAULT_TYPE, service, year, month):
+    ss = setup_sheet()
+    context.user_data["cr_ss"] = ss
+    context.user_data["cr_service"] = service
+    context.user_data["cr_scope"] = (int(year), int(month))
+    dates = [d for d, _role, _person in upcoming_assignments(ss.worksheet(service))
+             if dt.date.fromisoformat(d).year == int(year) and dt.date.fromisoformat(d).month == int(month)]
+    names = sorted({person for d, _role, person in upcoming_assignments(ss.worksheet(service)) if d in dates})
+    if not names:
+        await update.message.reply_text(f"No upcoming {service} assignments found for {dt.date(int(year), int(month), 1).strftime('%B %Y')}.")
+        return ConversationHandler.END
+    buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in names]
+    await update.message.reply_text(
+        f"Adjust your {service} schedule for {dt.date(int(year), int(month), 1).strftime('%B %Y')} — which name is yours?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CANCEL_NAME
 
 
 async def cancel_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3816,6 +3891,10 @@ async def cancel_select_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     name = query.data
     context.user_data["cr_name"] = name
     entries = upcoming_assignments(ss.worksheet(service), name)
+    scope = context.user_data.get("cr_scope")
+    if scope:
+        entries = [(d, role, person) for d, role, person in entries
+                   if (dt.date.fromisoformat(d).year, dt.date.fromisoformat(d).month) == scope]
     if not entries:
         await query.edit_message_text(f"{name} has no upcoming {service} roles.")
         return ConversationHandler.END
@@ -3840,18 +3919,13 @@ async def cancel_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     candidates = available_replacements(ss, service, date_str, role, name)
     pretty = dt.date.fromisoformat(date_str).strftime("%A, %B %d")
-    if not candidates:
-        await query.edit_message_text(
-            f"Nobody else is available for {role} on {pretty} based on the submitted preferences "
-            f"and who's already scheduled that day.\nPlease talk to the admin — they can pick anyone with /substitute."
-        )
-        return ConversationHandler.END
-
     buttons = [[InlineKeyboardButton(p, callback_data=p)] for p in candidates]
+    if name != TBA:
+        buttons.append([InlineKeyboardButton("TBA", callback_data=TBA)])
     buttons.append([InlineKeyboardButton("Never mind, keep my role", callback_data="nevermind")])
     await query.edit_message_text(
         f"{name} is cancelling {role} on {pretty}.\n\n"
-        f"Available partakers (based on preferences):\n"
+        f"Available partakers (based on preferences), or mark the replacement TBA:\n"
         f"Please ask one of them first, then tap their name to confirm.",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -5291,12 +5365,31 @@ def get_round_partaker_names(ss, round_):
     for role in get_round_roles(ss, round_):
         if role != "Preacher":
             names.update(get_role_pool(ss, service, role))
-    names.discard(LIVE_BROADCAST)
+    names -= PLACEHOLDER_PARTAKERS
     return sorted(names) or get_roster_names(ss)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
+    if args and args[0].startswith("adjust_"):
+        pieces = args[0].split("_")
+        if len(pieces) == 5:
+            _, service, year, month, raw_chat_id = pieces
+            if service in POSTED_SERVICES:
+                try:
+                    year, month, chat_id = int(year), int(month), -abs(int(raw_chat_id))
+                    if not 1 <= month <= 12:
+                        raise ValueError
+                except ValueError:
+                    await update.message.reply_text("That schedule adjustment link is invalid.")
+                    return ConversationHandler.END
+                ss = setup_sheet()
+                record_schedule_feedback(
+                    ss, service, year, month, chat_id, update.effective_user, "adjust_requested"
+                )
+                return await cancel_role_start_for_service(update, context, service, year, month)
+        await update.message.reply_text("That schedule adjustment link is invalid or expired.")
+        return ConversationHandler.END
     if not args or not args[0].startswith("pref_"):
         await update.message.reply_text(
             "Hi! I'm the service scheduling bot. Choose an option below. "
@@ -5559,7 +5652,7 @@ async def mark_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_T
         else:
             new_rows.append([date_str, role, LIVE_BROADCAST, "scheduled"])
         log_adjustment(ss, service, date_str, role, old_partaker, LIVE_BROADCAST, "live_broadcast")
-        if role in random_roles and old_partaker and old_partaker != LIVE_BROADCAST:
+        if role in random_roles and old_partaker and old_partaker not in PLACEHOLDER_PARTAKERS:
             counts[old_partaker] = max(0, counts[old_partaker] - 1)
         marked += 1
 
@@ -5731,6 +5824,7 @@ def build_app():
     app.add_handler(CommandHandler("post_summary", post_summary_command))
     app.add_handler(CallbackQueryHandler(from_menu(post_summary_command), pattern=r"^menu:post_summary$"))
     app.add_handler(CallbackQueryHandler(post_summary_callback, pattern=r"^post:"))
+    app.add_handler(CallbackQueryHandler(schedule_feedback_callback, pattern=r"^schedule:confirm:"))
 
     generate_conv = ConversationHandler(
         entry_points=[CommandHandler("generate", generate_schedule_start), menu_entry("generate", generate_schedule_start)],
@@ -5971,6 +6065,10 @@ def build_app():
         states={
             PREF_SELECT_NAME: [CallbackQueryHandler(pref_select_name)],
             PREF_SELECT_DATE: [CallbackQueryHandler(pref_select_date)],
+            CANCEL_NAME: [CallbackQueryHandler(cancel_select_name)],
+            CANCEL_PICK: [CallbackQueryHandler(cancel_pick_entry)],
+            CANCEL_REPLACEMENT: [CallbackQueryHandler(cancel_pick_replacement)],
+            CANCEL_CONFIRM: [CallbackQueryHandler(cancel_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
