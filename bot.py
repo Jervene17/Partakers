@@ -814,6 +814,8 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
             by_date[role].update(adjacent.get(role, {}))
         assigned_n = defaultdict(int)                       # person -> assignments so far this month
         for (fd, frole), fperson in already_filled.items():
+            if frole.startswith("__tech_taken__"):
+                continue
             if fd in month_strs:
                 role_times[frole][fperson] += 1
                 worked[fperson].add(fd)
@@ -2827,11 +2829,20 @@ def get_already_filled(ws, dates, exclude_roles=()):
     lets callers keep a role (e.g. "Preacher") out of this dict when it's
     already handled by its own dedicated precondition/exclusion logic."""
     date_strs = {d.isoformat() for d in dates}
-    return {
-        (r["Date"], r["Role"]): r["Partaker"]
-        for r in ws.get_all_records()
-        if r.get("Date") in date_strs and r.get("Role") not in exclude_roles
-    }
+    result = {}
+    extra_tech_index = 0
+    for r in ws.get_all_records():
+        date_str, role, person = r.get("Date"), r.get("Role"), r.get("Partaker")
+        if date_str not in date_strs or role in exclude_roles or not person:
+            continue
+        if role in TECH_ROLES_BY_SERVICE.get(ws.title, {}) and (date_str, role) in result:
+            # Preserve every Tech person in the same-day exclusion set even
+            # though this mapping normally stores one person per role/date.
+            result[(date_str, f"__tech_taken__{extra_tech_index}")] = person
+            extra_tech_index += 1
+        else:
+            result[(date_str, role)] = person
+    return result
 
 
 def get_person_roles_on_date(ss, service, date_str, person, ignore_role=None):
@@ -4010,13 +4021,26 @@ def build_template_rows(ss, service_type, dates):
     person only needs to type into the empty cells (e.g. Tech's own
     irregular schedule) rather than re-enter everything."""
     ws = ss.worksheet(service_type)
-    existing = {(r["Date"], r["Role"]): r["Partaker"] for r in ws.get_all_records()}
+    records = ws.get_all_records()
+    existing = {(r["Date"], r["Role"]): r["Partaker"] for r in records}
+    existing_tech = defaultdict(list)
+    for r in records:
+        if r.get("Role") in TECH_ROLES_BY_SERVICE.get(service_type, {}) and r.get("Partaker"):
+            existing_tech[(r["Date"], r["Role"])].append(r["Partaker"])
     configs = load_service_configs(ss)
     roles = list(configs.get(service_type, {}).get("roles", {}).keys()) or get_distinct_roles(ws)
     rows = []
     for d in dates:
         for role in roles:
-            rows.append([service_type, d.isoformat(), role, existing.get((d.isoformat(), role), "")])
+            key = (d.isoformat(), role)
+            if role in TECH_ROLES_BY_SERVICE.get(service_type, {}):
+                # Tech usually has multiple people. Repeated rows with the same
+                # date and role represent separate Tech assignments on upload.
+                people = existing_tech.get(key, [])
+                for person in people + [""] * max(0, 2 - len(people)):
+                    rows.append([service_type, key[0], role, person])
+            else:
+                rows.append([service_type, key[0], role, existing.get(key, "")])
     return rows
 
 
@@ -4123,6 +4147,7 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
     known_tabs = {ws.title for ws in ss.worksheets()}
     total = 0
     skipped = []
+    skipped_tech = []
     warnings = []
     for service, entries in by_service.items():
         if service not in known_tabs:
@@ -4131,9 +4156,26 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
         ws = ss.worksheet(service)
         records = ws.get_all_records()
         row_index = {(r["Date"], r["Role"]): (i + 2, r["Partaker"]) for i, r in enumerate(records)}
+        tech_roles = set(TECH_ROLES_BY_SERVICE.get(service, {}))
+        existing_tech = defaultdict(set)
+        for r in records:
+            if r.get("Role") in tech_roles and r.get("Partaker"):
+                existing_tech[(r["Date"], r["Role"])].add(r["Partaker"])
         new_rows, changed = [], []
         for date_str, role, partaker in entries:
             key = (date_str, role)
+            if role in tech_roles:
+                if partaker not in get_role_pool(ss, service, role):
+                    skipped_tech.append(f"{service} {date_str} {role}: {partaker} (not eligible)")
+                    continue
+                # Multiple rows for one date/role are distinct Tech members;
+                # preserve existing members and append only new names.
+                if partaker not in existing_tech[key]:
+                    new_rows.append([date_str, role, partaker, "scheduled"])
+                    existing_tech[key].add(partaker)
+                    changed.append((date_str, role, partaker))
+                    total += 1
+                continue
             if key in row_index:
                 row_num, current = row_index[key]
                 if current != partaker:
@@ -4151,6 +4193,10 @@ async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_T
     msg = f"Bulk upload processed: {total} entr{'y' if total == 1 else 'ies'} updated."
     if skipped:
         msg += f"\nSkipped unknown service(s): {', '.join(skipped)}"
+    if skipped_tech:
+        msg += "\nSkipped Tech assignment(s) because the person is not eligible:\n" + "\n".join(
+            f"- {item}" for item in skipped_tech
+        )
     if warnings:
         msg += ("\n\n⚠️ This upload left someone with two roles on the same day:\n"
                 + "\n".join(f"- {w}" for w in warnings)
