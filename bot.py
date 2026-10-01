@@ -4232,6 +4232,163 @@ async def template_select_period(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+# --- /fill_empty: manually fill a generated role that has no assignee ---
+
+FILL_EMPTY_SERVICE, FILL_EMPTY_PERIOD, FILL_EMPTY_SLOT, FILL_EMPTY_PERSON, FILL_EMPTY_CONFIRM = range(90, 95)
+
+
+async def fill_empty_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ss = setup_sheet()
+    context.user_data["fill_empty_ss"] = ss
+    buttons = [[InlineKeyboardButton(s, callback_data=s)] for s in get_all_schedule_tabs(ss)]
+    await update.message.reply_text("Fill an empty slot for which service?", reply_markup=InlineKeyboardMarkup(buttons))
+    return FILL_EMPTY_SERVICE
+
+
+async def fill_empty_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service = query.data
+    context.user_data["fill_empty_service"] = service
+    configs = load_service_configs(context.user_data["fill_empty_ss"])
+    cadence = configs.get(service, {}).get("cadence", "month")
+    if cadence == "week":
+        mondays = upcoming_mondays()
+        context.user_data["fill_empty_mondays"] = mondays
+        buttons = [[InlineKeyboardButton(
+            f"{monday.strftime('%b %d')} - {(monday + dt.timedelta(days=6)).strftime('%b %d')}",
+            callback_data=str(i),
+        )] for i, monday in enumerate(mondays)]
+        await query.edit_message_text("Which week?", reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await query.edit_message_text("Which month?", reply_markup=month_keyboard())
+    return FILL_EMPTY_PERIOD
+
+
+async def fill_empty_select_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ss = context.user_data["fill_empty_ss"]
+    service = context.user_data["fill_empty_service"]
+    cadence = load_service_configs(ss).get(service, {}).get("cadence", "month")
+    if cadence == "week":
+        monday = context.user_data["fill_empty_mondays"][int(query.data)]
+        dates = week_dates(service, monday)
+    else:
+        year, month = map(int, query.data.split("-"))
+        dates = get_service_month_dates(ss, service, year, month)
+
+    configs = load_service_configs(ss)
+    roles = list(configs.get(service, {}).get("roles", {}).keys())
+    if not roles:
+        roles = get_distinct_roles(ss.worksheet(service))
+    roles = [r for r in roles if r != "Preacher" and r not in TECH_ROLES_BY_SERVICE.get(service, {})]
+    date_keys = {d.isoformat() for d in dates}
+    occupied = {
+        (r.get("Date"), r.get("Role"))
+        for r in ss.worksheet(service).get_all_records()
+        if r.get("Date") in date_keys and r.get("Partaker")
+    }
+    empty = [(d.isoformat(), role) for d in dates for role in roles if (d.isoformat(), role) not in occupied]
+    if not empty:
+        await query.edit_message_text(f"No empty role slots found for {service} in that period.")
+        return ConversationHandler.END
+
+    context.user_data["fill_empty_slots"] = empty
+    buttons = [[InlineKeyboardButton(
+        f"{dt.date.fromisoformat(date_str).strftime('%b %d')} — {role}", callback_data=str(i)
+    )] for i, (date_str, role) in enumerate(empty)]
+    await query.edit_message_text("Choose an empty slot:", reply_markup=InlineKeyboardMarkup(buttons))
+    return FILL_EMPTY_SLOT
+
+
+async def fill_empty_select_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    date_str, role = context.user_data["fill_empty_slots"][int(query.data)]
+    context.user_data["fill_empty_date"] = date_str
+    context.user_data["fill_empty_role"] = role
+    return await fill_empty_ask_person(query, context)
+
+
+async def fill_empty_ask_person(query, context: ContextTypes.DEFAULT_TYPE, note=""):
+    ss = context.user_data["fill_empty_ss"]
+    service = context.user_data["fill_empty_service"]
+    date_str = context.user_data["fill_empty_date"]
+    role = context.user_data["fill_empty_role"]
+    eligible = [p for p in get_role_pool(ss, service, role)
+                if not preacher_partaker_conflicts(ss, service, role, date_str, p)]
+    if not eligible:
+        await query.edit_message_text(f"No eligible person can fill {role} on {date_str} under the Preacher rule.")
+        return ConversationHandler.END
+    buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in eligible]
+    await query.edit_message_text(
+        note + f"Who should fill {role} on {date_str}?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return FILL_EMPTY_PERSON
+
+
+async def fill_empty_pick_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = query.data
+    ss = context.user_data["fill_empty_ss"]
+    service = context.user_data["fill_empty_service"]
+    date_str = context.user_data["fill_empty_date"]
+    role = context.user_data["fill_empty_role"]
+    hard_conflicts = preacher_partaker_conflicts(ss, service, role, date_str, name)
+    if hard_conflicts:
+        return await fill_empty_ask_person(
+            query, context,
+            note=f"⛔ {name} has {', '.join(hard_conflicts)} on {date_str} and cannot take another role.\n\n",
+        )
+    conflicts = find_conflicts(ss, service, date_str, name)
+    if conflicts:
+        context.user_data["fill_empty_name"] = name
+        buttons = [
+            [InlineKeyboardButton("Yes, assign anyway", callback_data="yes")],
+            [InlineKeyboardButton("No, choose someone else", callback_data="no")],
+        ]
+        await query.edit_message_text(
+            conflict_warning_text(name, date_str, conflicts, role), reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return FILL_EMPTY_CONFIRM
+    return await fill_empty_save(query, context, name)
+
+
+async def fill_empty_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data != "yes":
+        return await fill_empty_ask_person(query, context)
+    return await fill_empty_save(query, context, context.user_data["fill_empty_name"])
+
+
+async def fill_empty_save(query, context: ContextTypes.DEFAULT_TYPE, name):
+    ss = context.user_data["fill_empty_ss"]
+    service = context.user_data["fill_empty_service"]
+    date_str = context.user_data["fill_empty_date"]
+    role = context.user_data["fill_empty_role"]
+    ws = ss.worksheet(service)
+    row_num, current = get_role_row(ws, role, date_str)
+    if row_num is not None and current:
+        await query.edit_message_text(f"{service} — {role} on {date_str} was filled while you were choosing. Nothing was changed.")
+        return ConversationHandler.END
+    hard_conflicts = preacher_partaker_conflicts(ss, service, role, date_str, name)
+    if hard_conflicts:
+        return await fill_empty_ask_person(
+            query, context,
+            note=f"⛔ {name} has {', '.join(hard_conflicts)} on {date_str} and cannot take another role.\n\n",
+        )
+    if row_num is not None:
+        ws.update_cell(row_num, 3, name)
+    else:
+        write_role_assignments(ss, service, role, [(date_str, name)])
+    await refresh_posts(context, ss, service, [date_str])
+    await query.edit_message_text(f"Filled {service} — {role} on {date_str} with {name}.")
+    return ConversationHandler.END
+
+
 async def handle_schedule_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global (non-conversation) handler: any .csv document sent to the bot
     is treated as a filled-in template from /template and upserted directly
@@ -5444,6 +5601,7 @@ MAIN_MENU_ROWS = [
     [_menu_btn("📌 Review & post summary", "post_summary")],
     [_menu_btn("🎤 Set preacher", "set_preacher"), _menu_btn("🌄 Set Predawn pattern", "set_predawn_pattern")],
     [_menu_btn("🎛 Log tech", "log_tech"), _menu_btn("📝 Log a role", "log_role")],
+    [_menu_btn("✍️ Fill an empty slot", "fill_empty")],
     [_menu_btn("🔄 Adjustments ›", "adjust")],
     [_menu_btn("🔎 Pull schedule", "pull_schedule"), _menu_btn("👤 Pull person", "pull_person")],
     [_menu_btn("➕ Add service", "add_service"), _menu_btn("➕ Add role", "add_role")],
@@ -5732,6 +5890,17 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    fill_empty_conv = ConversationHandler(
+        entry_points=[CommandHandler("fill_empty", fill_empty_start), menu_entry("fill_empty", fill_empty_start)],
+        states={
+            FILL_EMPTY_SERVICE: [CallbackQueryHandler(fill_empty_select_service)],
+            FILL_EMPTY_PERIOD: [CallbackQueryHandler(fill_empty_select_period)],
+            FILL_EMPTY_SLOT: [CallbackQueryHandler(fill_empty_select_slot)],
+            FILL_EMPTY_PERSON: [CallbackQueryHandler(fill_empty_pick_person)],
+            FILL_EMPTY_CONFIRM: [CallbackQueryHandler(fill_empty_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     app.add_handler(generate_conv)
     app.add_handler(preacher_conv)
     app.add_handler(predawn_conv)
@@ -5749,6 +5918,7 @@ def build_app():
     app.add_handler(special_request_conv)
     app.add_handler(roster_conv)
     app.add_handler(template_conv)
+    app.add_handler(fill_empty_conv)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_schedule_upload))
     app.add_handler(CommandHandler("refresh_dashboard", refresh_dashboard_command))
     app.add_handler(CommandHandler("sync_dashboard", sync_dashboard_command))
