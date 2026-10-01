@@ -734,7 +734,7 @@ def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude
 
 
 SUNDAY_OFF_MIN_ASSIGNMENTS = 3     # a partaker with 3+ assignments in the month is guaranteed a Sunday off (soft)
-REPEATABLE_ROLES = {"Praise Leader"}   # may be held more than once a month, never on consecutive Sundays
+REPEATABLE_ROLES = {"Praise Leader", "Presider"}   # up to twice a month, never on consecutive Sundays
 MAX_REPEAT_PER_MONTH = 2
 
 
@@ -791,18 +791,19 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
     Rules
     HARD (never broken):
       * anyone who marked a date unavailable is never picked that date
-      * Filipino Preacher exclusion (Sunday)
-      * Sunday: a role can't be held twice in a month, EXCEPT Praise Leader: at
-        most twice, and never on consecutive Sundays (the last Sunday of a
-        month vs the first Sunday of the next month counts)
+      * Preacher and Filipino Preacher never take another partaker role that date
+      * Sunday: a role can't be held twice in a month, EXCEPT Praise Leader and
+        Presider: each may be held at most twice, and never on consecutive
+        Sundays (the last Sunday of a month vs the first Sunday of the next month counts)
     SOFT (broken only if nobody else can fill the slot):
       * partakers on the lists of 3+ generated roles, with no unavailable
         dates that month, get at least 1 Sunday off
       * Praise Leader: prefer someone who hasn't held it yet this month
-    NO EMPTY SLOTS. Fill order: 1) normal rules 2) Representative Prayer may
-      borrow an eligible Presider who isn't presiding this month 3) a 2nd role
-      on the same day (not the Preacher) 4) the Preacher too. A slot is only
-      left empty if every eligible person is unavailable/blocked by a hard rule.
+    Fallbacks: Representative Prayer may borrow an eligible Presider who is
+      available that date, even if they presided earlier in the month. Praise
+      Leader and Presider can each repeat up to twice in the month, never on
+      consecutive Sundays. Other same-day role conflicts may be relaxed as a
+      last resort, but preacher exclusions and unavailability remain hard rules.
 
     Returns: (list of (date_str, role, partaker), updated counts dict)
     """
@@ -848,7 +849,7 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
             preacher = preacher_assignments[date_str]  # precondition: must exist
             schedule_rows.append((date_str, "Preacher", preacher))
 
-            taken_today = {preacher}  # preacher gets no other role (unless it's the very last resort)
+            taken_today = {preacher}  # preacher is also protected by `never` below
             # anyone who already claimed ANY role this date (via preference
             # round) is also excluded from every other role that date
             for (fd, _frole), fperson in already_filled.items():
@@ -888,13 +889,22 @@ def generate_schedule(service_type, year_month_list, counts, preacher_assignment
 
                 pools = [eligible]
                 if role == "Representative Prayer" and "Presider" in roles:
-                    # nobody from the Rep Prayer list is free: an eligible Presider who isn't presiding this month
-                    pools.append([p for p in roles["Presider"] if p not in role_times["Presider"]])
+                    # If the Rep Prayer list can't fill this date, borrow any
+                    # eligible Presider who is still free that date. They may
+                    # already have presided on another Sunday this month.
+                    pools.append(roles["Presider"])
 
                 person, borrowed = None, False
                 for busy in (taken_today, {preacher}, set()):
                     for pool in pools:
-                        person = pick_partaker(pool, counts, busy, hard_exclude, soft_exclude, never, strict=True)
+                        borrowed_hard_exclude = hard_exclude
+                        if pool is not eligible:
+                            # A borrowed Presider must actually be free today;
+                            # the generic last-resort pass must not double-book them.
+                            borrowed_hard_exclude = set(hard_exclude) | (taken_today - {preacher})
+                        person = pick_partaker(
+                            pool, counts, busy, borrowed_hard_exclude, soft_exclude, never, strict=True
+                        )
                         if person:
                             borrowed = pool is not eligible
                             break
