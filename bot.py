@@ -733,7 +733,7 @@ def pick_partaker(eligible, counts, taken_today, hard_exclude=None, soft_exclude
     return random.choice(least_assigned)
 
 
-SUNDAY_OFF_MIN_ASSIGNMENTS = 3     # a partaker with 3+ assignments in the month is guaranteed a Sunday off (soft)
+SUNDAY_OFF_MIN_ASSIGNMENTS = 4     # softly prefer a Sunday off once someone has 4+ assignments in the month
 REPEATABLE_ROLES = {"Praise Leader", "Presider"}   # up to twice a month, never on consecutive Sundays
 MAX_REPEAT_PER_MONTH = 2
 
