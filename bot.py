@@ -3376,13 +3376,13 @@ def summary_target_chat_ids(ss, service):
     """Groups that get this service's monthly summary:
     Sunday    -> Service Partakers, Filipino Translators, and every role group (Praise Leader, Presider, Representative Prayer)
     Wednesday -> Service Partakers and every role group (Presider, Representative Prayer)
-    SunStopSundays -> Main Departments only"""
+    SunStopSundays -> Main Departments and Praise Leader groups"""
     if service == "Sunday":
         purposes = ["Service Partakers", "Filipino Translators"]
     elif service == "Wednesday":
         purposes = ["Service Partakers"]
     elif service == "SunStopSundays":
-        purposes = ["Main Departments"]
+        purposes = ["Main Departments", "Praise Leader"]
     else:
         return []
     if service in ("Sunday", "Wednesday"):
