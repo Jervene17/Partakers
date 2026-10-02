@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import escape_markdown
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
@@ -335,10 +336,11 @@ SHEET_TABS = [
     "PostedSummaries",
     "ScheduleFeedback",
     "Tech",
+    "SunStopRepresentatives",
 ]
 
 TAB_HEADERS = {
-    "Roster": ["Name", "AssignmentCount"],
+    "Roster": ["Name", "AssignmentCount", "userID", "userName"],
     "Sunday": ["Date", "Role", "Partaker", "Status"],
     "Wednesday": ["Date", "Role", "Partaker", "Status"],
     "Predawn": ["Date", "Role", "Partaker", "Status"],
@@ -362,9 +364,10 @@ TAB_HEADERS = {
     "Unavailability": ["Service", "Date", "Partaker"],
     # Remembers which group message holds each pinned monthly summary, so it
     # can be edited in place whenever the schedule changes.
-    "PostedSummaries": ["Service", "Year", "Month", "ChatID", "MessageID"],
+    "PostedSummaries": ["Service", "Year", "Month", "ChatID", "MessageID", "Status"],
     "ScheduleFeedback": ["Service", "Year", "Month", "ChatID", "UserID", "UserName", "Response", "Details", "Timestamp"],
     "Tech": ["Service", "Date", "Role", "Partaker", "Status"],
+    "SunStopRepresentatives": ["Date", "Role", "Department", "Representative", "SubmittedBy", "SubmittedAt"],
 }
 
 DASHBOARD_MONTHS_AHEAD = 3  # how many upcoming months each dashboard tab shows
@@ -1080,12 +1083,14 @@ def format_schedule_summary(service_type, schedule_rows):
     for date_str, role, person in schedule_rows:
         by_date[date_str].append((role, person))
 
-    lines = [f"*{service_type} Service Schedule*\n"]
+    lines = [f"*{escape_markdown(str(service_type), version=1)} Service Schedule*\n"]
     for date_str in sorted(by_date):
         d = dt.date.fromisoformat(date_str)
         lines.append(f"*{d.strftime('%B %d, %Y')}*")
         for role, person in by_date[date_str]:
-            lines.append(f"{role} - {person}")
+            lines.append(
+                f"{escape_markdown(str(role), version=1)} - {escape_markdown(str(person), version=1)}"
+            )
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -1693,9 +1698,16 @@ async def select_sunstop_month(update: Update, context: ContextTypes.DEFAULT_TYP
     save_assignment_counts(ss, counts)
 
     summary = format_schedule_summary(
-        "Sun Stop Sundays", add_tech_rows(ss, "SunStopSundays", schedule_rows)
+        "Sun Stop Sundays",
+        sunstop_summary_rows_with_representatives(
+            ss, add_tech_rows(ss, "SunStopSundays", schedule_rows)
+        ),
     )
     await query.message.reply_text(summary, parse_mode="Markdown")
+    await query.message.reply_text(
+        "👀 Review the Sun Stop Sundays schedule. It will only be sent to the Main Departments group.",
+        reply_markup=post_confirm_markup("SunStopSundays", year, month),
+    )
     return ConversationHandler.END
 
 
@@ -2449,6 +2461,32 @@ def get_roster_names(ss):
     return sorted(set(roster_ws.col_values(1)[1:]))
 
 
+def roster_telegram_ids(ss):
+    """Map roster names and configured usernames to valid Telegram user IDs."""
+    result = {}
+    for row in ss.worksheet("Roster").get_all_records():
+        name = str(row.get("Name") or "").strip()
+        user_id = str(row.get("userID") or row.get("UserID") or row.get("userid") or "").strip()
+        if user_id.endswith(".0") and user_id[:-2].isdigit():
+            user_id = user_id[:-2]
+        if not name or not user_id.isdigit():
+            continue
+        result[name.casefold()] = user_id
+        username = str(row.get("userName") or row.get("UserName") or row.get("username") or "").strip()
+        if username:
+            result[username.casefold().lstrip("@")] = user_id
+    return result
+
+
+def telegram_partaker(ss, value):
+    """HTML-safe scheduled name, linked to its Telegram account when mapped."""
+    name = str(value or "TBA")
+    user_id = roster_telegram_ids(ss).get(name.strip().casefold())
+    if user_id:
+        return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+    return html.escape(name)
+
+
 def rows_in_month(records, year, month):
     prefix = f"{year:04d}-{month:02d}"
     return [r for r in records if r.get("Date", "").startswith(prefix)]
@@ -2721,7 +2759,10 @@ REMINDER_ROLE_ORDER = {
 def get_rows_for_date(ss, service_type, date):
     ws = ss.worksheet(service_type)
     date_str = date.isoformat()
-    return [r for r in ws.get_all_records() if r.get("Date") == date_str]
+    rows = [r for r in ws.get_all_records() if r.get("Date") == date_str]
+    if service_type == "SunStopSundays":
+        rows = sunstop_rows_with_representatives(ss, rows)
+    return rows
 
 
 def get_group_chat_id(ss, purpose):
@@ -2730,6 +2771,178 @@ def get_group_chat_id(ss, purpose):
         if r.get("Purpose") == purpose:
             return r.get("ChatID") or None
     return None
+
+
+def sunstop_rep_records(ss, year=None, month=None):
+    records = ss.worksheet("SunStopRepresentatives").get_all_records()
+    prefix = f"{year:04d}-{month:02d}" if year and month else None
+    return [r for r in records if not prefix or str(r.get("Date", "")).startswith(prefix)]
+
+
+def sunstop_rows_with_representatives(ss, rows):
+    """Show a submitted person alongside the department assigned to that role."""
+    reps = {(r.get("Date"), r.get("Role")): (r.get("Department"), r.get("Representative"))
+            for r in ss.worksheet("SunStopRepresentatives").get_all_records()}
+    out = []
+    for row in rows:
+        item = dict(row)
+        dept, rep = reps.get((item.get("Date"), item.get("Role")), (None, None))
+        if item.get("Partaker") in SUN_STOP_DEPTS:
+            item["Department"] = dept or item["Partaker"]
+            item["Representative"] = rep or ""
+            if rep:
+                item["Partaker"] = rep
+        out.append(item)
+    return out
+
+
+def sunstop_summary_rows_with_representatives(ss, rows):
+    reps = {(r.get("Date"), r.get("Role")): (r.get("Department"), r.get("Representative"))
+            for r in ss.worksheet("SunStopRepresentatives").get_all_records()}
+    out = []
+    for date_str, role, partaker in rows:
+        dept, rep = reps.get((date_str, role), (None, None))
+        if dept and rep and partaker == dept:
+            partaker = f"{rep} ({dept})"
+        elif partaker in SUN_STOP_DEPTS:
+            partaker = f"{partaker} (representative not submitted)"
+        out.append((date_str, role, partaker))
+    return out
+
+
+def sunstop_slots_for_department(ss, year, month, department):
+    schedule = rows_in_month(ss.worksheet("SunStopSundays").get_all_records(), year, month)
+    submitted = {(r.get("Date"), r.get("Role"))
+                 for r in sunstop_rep_records(ss, year, month) if r.get("Representative")}
+    return sorted(
+        {(r.get("Date"), r.get("Role")) for r in schedule
+         if r.get("Partaker") == department and (r.get("Date"), r.get("Role")) not in submitted},
+        key=lambda item: (item[0], item[1]),
+    )
+
+
+def save_sunstop_representative(ss, date_str, role, department, representative, user):
+    ws = ss.worksheet("SunStopRepresentatives")
+    values = [date_str, role, department, representative, str(user.id), dt.datetime.now(CHURCH_TZ).isoformat()]
+    for i, row in enumerate(ws.get_all_records()):
+        if row.get("Date") == date_str and row.get("Role") == role:
+            if row.get("Representative"):
+                return False
+            ws.update(range_name=f"A{i + 2}:F{i + 2}", values=[values])
+            return True
+    ws.append_row(values)
+    return True
+
+
+SUNSTOP_REP_DEPARTMENT, SUNSTOP_REP_SLOT, SUNSTOP_REP_NAME = range(210, 213)
+
+
+async def sunstop_rep_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        pass  # still process the submission if Telegram has expired the spinner
+    try:
+        _prefix, _action, year, month = query.data.split(":")
+        year, month = int(year), int(month)
+    except (ValueError, AttributeError):
+        await query.message.reply_text("That Sun Stop schedule link is invalid.")
+        return ConversationHandler.END
+
+    ss = setup_sheet()
+    schedule = rows_in_month(ss.worksheet("SunStopSundays").get_all_records(), year, month)
+    departments = sorted({r.get("Partaker") for r in schedule if r.get("Partaker") in SUN_STOP_DEPTS})
+    context.user_data["sunstop_rep_year"] = year
+    context.user_data["sunstop_rep_month"] = month
+    context.user_data["sunstop_rep_ss"] = ss
+    context.user_data["sunstop_rep_depts"] = {str(i): dept for i, dept in enumerate(departments)}
+    buttons = [[InlineKeyboardButton(dept, callback_data=f"sunstop:dept:{i}")]
+               for i, dept in enumerate(departments)]
+    if not buttons:
+        await query.message.reply_text("No department assignments are available for that schedule.")
+        return ConversationHandler.END
+    await query.message.reply_text(
+        f"{query.from_user.full_name}, choose the department you are submitting for:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return SUNSTOP_REP_DEPARTMENT
+
+
+async def sunstop_rep_select_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = query.data.rsplit(":", 1)[-1]
+    department = context.user_data.get("sunstop_rep_depts", {}).get(index)
+    if not department:
+        await query.edit_message_text("That department choice expired. Please tap Log your representative again.")
+        return ConversationHandler.END
+    year, month = context.user_data["sunstop_rep_year"], context.user_data["sunstop_rep_month"]
+    ss = context.user_data["sunstop_rep_ss"]
+    slots = sunstop_slots_for_department(ss, year, month, department)
+    if not slots:
+        await query.edit_message_text(f"{department} has no open representative assignment in this schedule.")
+        return ConversationHandler.END
+    context.user_data["sunstop_rep_department"] = department
+    context.user_data["sunstop_rep_slots"] = {str(i): slot for i, slot in enumerate(slots)}
+    if len(slots) == 1:
+        date_str, role = slots[0]
+        context.user_data["sunstop_rep_date"] = date_str
+        context.user_data["sunstop_rep_role"] = role
+        await query.edit_message_text(
+            f"Type the representative's name for {role} on {date_str} ({department})."
+        )
+        return SUNSTOP_REP_NAME
+    buttons = [[InlineKeyboardButton(
+        f"{dt.date.fromisoformat(date_str).strftime('%b %d')} — {role}",
+        callback_data=f"sunstop:slot:{i}",
+    )] for i, (date_str, role) in enumerate(slots)]
+    await query.edit_message_text(
+        f"{department} has more than one open assignment. Choose the date and role:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return SUNSTOP_REP_SLOT
+
+
+async def sunstop_rep_select_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = query.data.rsplit(":", 1)[-1]
+    slot = context.user_data.get("sunstop_rep_slots", {}).get(index)
+    if not slot:
+        await query.edit_message_text("That assignment choice expired. Please tap Log your representative again.")
+        return ConversationHandler.END
+    date_str, role = slot
+    context.user_data["sunstop_rep_date"] = date_str
+    context.user_data["sunstop_rep_role"] = role
+    department = context.user_data["sunstop_rep_department"]
+    await query.edit_message_text(
+        f"Type the representative's name for {role} on {date_str} ({department})."
+    )
+    return SUNSTOP_REP_NAME
+
+
+async def sunstop_rep_enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    representative = (update.message.text or "").strip()
+    if not representative or len(representative) > 100:
+        await update.message.reply_text("Please type a name up to 100 characters long.")
+        return SUNSTOP_REP_NAME
+    ss = context.user_data["sunstop_rep_ss"]
+    date_str = context.user_data["sunstop_rep_date"]
+    role = context.user_data["sunstop_rep_role"]
+    department = context.user_data["sunstop_rep_department"]
+    if not save_sunstop_representative(
+        ss, date_str, role, department, representative, update.effective_user
+    ):
+        await update.message.reply_text(
+            f"A representative is already logged for {role} on {date_str}. Please contact an admin if it needs changing."
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"Logged {representative} as {department}'s representative for {role} on {date_str}."
+    )
+    await refresh_posts(context, ss, "SunStopSundays", [date_str])
+    return ConversationHandler.END
 
 
 def set_group_chat_id(ss, purpose, chat_id):
@@ -2742,31 +2955,46 @@ def set_group_chat_id(ss, purpose, chat_id):
     ws.append_rows([[purpose, chat_id]])
 
 
-def format_daily_reminder(service_type, date, rows):
+def format_daily_reminder(service_type, date, rows, ss=None):
     """rows: list of {"Role":..., "Partaker":...} dicts for that single date.
     Sunday/Wednesday get the full prep-schedule block from the sample summary
     (with {pl}/{preacher} filled in for Wednesday's notes); Predawn and Sun
     Stop Sundays just list whatever roles are assigned, per your call to skip
     a prep block for those two."""
     lookup = {r["Role"]: r["Partaker"] for r in rows}
-    header = f"{SERVICE_DISPLAY_NAME[service_type]}\n{date.strftime('%B %d, %Y')}\n\n"
+    display = lambda value: telegram_partaker(ss, value) if ss else html.escape(str(value or "TBA"))
+    header = f"{html.escape(SERVICE_DISPLAY_NAME[service_type])}\n{date.strftime('%B %d, %Y')}\n\n"
 
     if service_type in REMINDER_ROLE_ORDER:
-        lines = [f"{label} - {lookup.get(role, 'TBA')}" for label, role in REMINDER_ROLE_ORDER[service_type]]
+        lines = [f"{html.escape(label)} - {display(lookup.get(role, 'TBA'))}" for label, role in REMINDER_ROLE_ORDER[service_type]]
         body = "\n".join(lines)
         if service_type == "Sunday":
             prep = PREP_SCHEDULE_SUNDAY
         else:
             prep = PREP_SCHEDULE_WEDNESDAY_TEMPLATE.format(
-                pl=lookup.get("Praise Leader", "TBA"), preacher=lookup.get("Preacher", "TBA")
+                pl=display(lookup.get("Praise Leader", "TBA")), preacher=display(lookup.get("Preacher", "TBA"))
             )
         return f"{header}{body}\n\n{prep}\n\n{REMINDER_FOOTER}"
 
-    if not lookup:
+    if service_type == "SunStopSundays":
+        body_lines = []
+        for row in rows:
+            role = html.escape(str(row.get("Role") or ""))
+            department = row.get("Department")
+            if department:
+                if row.get("Representative"):
+                    person = display(row["Representative"])
+                    body_lines.append(f"{role} — {html.escape(str(department))}: {person}")
+                else:
+                    body_lines.append(f"{role} — {html.escape(str(department))} (representative not submitted)")
+            else:
+                body_lines.append(f"{role} - {display(row.get('Partaker'))}")
+        body = "\n".join(body_lines) if body_lines else "No roles assigned yet — please check the schedule."
+    elif not lookup:
         body = "No roles assigned yet — please check the schedule."
     else:
-        body = "\n".join(f"{role} - {partaker}" for role, partaker in lookup.items())
-    return f"{header}{body}\n\nReminder: please prepare for tomorrow's service."
+        body = "\n".join(f"{html.escape(str(role))} - {display(partaker)}" for role, partaker in lookup.items())
+    return f"{header}{body}\n\nReminder: please prepare for tomorrow&#x27;s service."
 
 
 # NOTE: reminders are sent as plain text (no parse_mode). The Wednesday prep
@@ -2785,8 +3013,8 @@ async def send_sunday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
         return
     target = now.date() + dt.timedelta(days=4)
     rows = get_rows_for_date(ss, "Sunday", target)
-    text = format_daily_reminder("Sunday", target, rows)
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    text = format_daily_reminder("Sunday", target, rows, ss)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 async def send_wednesday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -2801,8 +3029,8 @@ async def send_wednesday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
         return
     target = now.date() + dt.timedelta(days=3)
     rows = get_rows_for_date(ss, "Wednesday", target)
-    text = format_daily_reminder("Wednesday", target, rows)
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    text = format_daily_reminder("Wednesday", target, rows, ss)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -2819,16 +3047,16 @@ async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
     fil_chat_id = get_group_chat_id(ss, "Filipino Translators")
     if fil_chat_id:
         rows = get_rows_for_date(ss, "FilipinoTranslation", target)
-        body = ("\n".join(f"{r['Role']} - {r['Partaker']}" for r in rows)
+        body = ("\n".join(f"{html.escape(str(r['Role']))} - {telegram_partaker(ss, r['Partaker'])}" for r in rows)
                 if rows else "No Filipino Translation roles assigned yet for this Sunday.")
         text = f"Filipino Translation Team\n{target.strftime('%B %d, %Y')}\n\n{body}"
-        await context.bot.send_message(chat_id=fil_chat_id, text=text)
+        await context.bot.send_message(chat_id=fil_chat_id, text=text, parse_mode="HTML")
 
     partaker_chat_id = get_group_chat_id(ss, "Service Partakers")
     if partaker_chat_id:
         rows = get_rows_for_date(ss, "SunStopSundays", target)
-        text = format_daily_reminder("SunStopSundays", target, rows)
-        await context.bot.send_message(chat_id=partaker_chat_id, text=text)
+        text = format_daily_reminder("SunStopSundays", target, rows, ss)
+        await context.bot.send_message(chat_id=partaker_chat_id, text=text, parse_mode="HTML")
 
 
 # --- /set_group_chat: run inside a Telegram group to register it as the
@@ -2844,6 +3072,7 @@ async def set_group_chat_start(update: Update, context: ContextTypes.DEFAULT_TYP
     buttons = [
         [InlineKeyboardButton("Service Partakers (everyone)", callback_data="Service Partakers")],
         [InlineKeyboardButton("Filipino Translators", callback_data="Filipino Translators")],
+        [InlineKeyboardButton("Main Departments", callback_data="Main Departments")],
     ] + [[InlineKeyboardButton(role, callback_data=role)] for role in role_group_purposes(ss)]
     await update.message.reply_text(
         "Register this group for which reminders? Pick 'Service Partakers' for a group covering "
@@ -2861,7 +3090,7 @@ async def set_group_purpose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.user_data["group_chat_id"]
     ss = setup_sheet()
     set_group_chat_id(ss, purpose, chat_id)
-    if purpose in ("Service Partakers", "Filipino Translators"):
+    if purpose in ("Service Partakers", "Filipino Translators", "Main Departments"):
         await query.edit_message_text(f"This group is now registered for '{purpose}' reminders.")
     else:
         await query.edit_message_text(
@@ -3140,20 +3369,24 @@ async def announce_update(context, ss, text):
 # Pinned monthly summaries in the groups (Sunday + Wednesday only, for now)
 # ---------------------------------------------------------------------------
 
-POSTED_SERVICES = ("Sunday", "Wednesday")  # Predawn / SunStopSundays: not posted to any group for now
+POSTED_SERVICES = ("Sunday", "Wednesday", "SunStopSundays")
 
 
 def summary_target_chat_ids(ss, service):
     """Groups that get this service's monthly summary:
     Sunday    -> Service Partakers, Filipino Translators, and every role group (Praise Leader, Presider, Representative Prayer)
-    Wednesday -> Service Partakers and every role group (Presider, Representative Prayer)"""
+    Wednesday -> Service Partakers and every role group (Presider, Representative Prayer)
+    SunStopSundays -> Main Departments only"""
     if service == "Sunday":
         purposes = ["Service Partakers", "Filipino Translators"]
     elif service == "Wednesday":
         purposes = ["Service Partakers"]
+    elif service == "SunStopSundays":
+        purposes = ["Main Departments"]
     else:
         return []
-    purposes += list(get_random_roles_for_service(ss, service).keys())
+    if service in ("Sunday", "Wednesday"):
+        purposes += list(get_random_roles_for_service(ss, service).keys())
     seen, ids = set(), []
     for purpose in purposes:
         chat_id = get_group_chat_id(ss, purpose)
@@ -3170,6 +3403,8 @@ def build_group_summary(ss, service, year, month):
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     rows = add_filipino_preacher_rows(ss, service, records_to_rows(rows))
     rows = add_tech_rows(ss, service, rows)
+    if service == "SunStopSundays":
+        rows = sunstop_summary_rows_with_representatives(ss, rows)
     return format_schedule_summary(f"{service} — {month_label}", rows)
 
 
@@ -3183,18 +3418,32 @@ def get_posted(ss, service, year, month):
     }
 
 
-def save_posted(ss, service, year, month, chat_id, message_id):
+def posted_status(ss, service, year, month):
+    return {
+        str(r.get("ChatID")): str(r.get("Status") or "review").casefold()
+        for r in ss.worksheet("PostedSummaries").get_all_records()
+        if r.get("Service") == service and str(r.get("Year")) == str(year)
+        and str(r.get("Month")) == str(month)
+    }
+
+
+def save_posted(ss, service, year, month, chat_id, message_id, status="review"):
     ws = ss.worksheet("PostedSummaries")
     for i, r in enumerate(ws.get_all_records()):
         if (r.get("Service") == service and str(r.get("Year")) == str(year)
                 and str(r.get("Month")) == str(month) and str(r.get("ChatID")) == str(chat_id)):
-            ws.update_cell(i + 2, 5, message_id)
+            ws.update(range_name=f"E{i + 2}:F{i + 2}", values=[[message_id, status]])
             return
-    ws.append_rows([[service, year, month, str(chat_id), message_id]])
+    ws.append_rows([[service, year, month, str(chat_id), message_id, status]])
 
 
 def schedule_feedback_keyboard(service, year, month, chat_id):
     adjust_url = f"https://t.me/{BOT_USERNAME}?start=adjust_{service}_{year}_{month}_{abs(int(chat_id))}"
+    if service == "SunStopSundays":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧑‍💼 Log your representative", callback_data=f"sunstop:rep:{year}:{month}")],
+            [InlineKeyboardButton("✏️ Adjust my schedule", url=adjust_url)],
+        ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ I'm good with this schedule", callback_data=f"schedule:confirm:{service}:{year}:{month}")],
         [InlineKeyboardButton("✏️ Adjust my schedule", url=adjust_url)],
@@ -3218,6 +3467,13 @@ def record_schedule_feedback(ss, service, year, month, chat_id, user, response, 
 
 async def schedule_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Acknowledge before Sheets I/O; otherwise Telegram expires the callback
+    # spinner and raises BadRequest after the feedback row has already changed.
+    try:
+        await query.answer("Saving your confirmation...")
+    except BadRequest as e:
+        if "query is too old" not in str(e).lower() and "query id is invalid" not in str(e).lower():
+            raise
     try:
         _, action, service, year, month = query.data.split(":")
     except ValueError:
@@ -3228,19 +3484,22 @@ async def schedule_feedback_callback(update: Update, context: ContextTypes.DEFAU
     record_schedule_feedback(
         ss, service, int(year), int(month), query.message.chat_id, query.from_user, "confirmed"
     )
-    await query.answer("Thanks — your confirmation is recorded.")
 
 
-async def post_or_update_summary(context, ss, service, year, month, create):
+async def post_or_update_summary(context, ss, service, year, month, create, confirmed=False):
     """create=True (after the admin confirms): in every target group, edit the month's existing post or
     post + pin a new one. create=False (after an adjustment): only edit posts that already exist.
     Returns status lines for the admin."""
     if service not in POSTED_SERVICES:
         return []
+    stored = get_posted(ss, service, year, month)
+    if not create and not confirmed:
+        confirmed = "confirmed" in posted_status(ss, service, year, month).values()
     text = build_group_summary(ss, service, year, month)
     if not text:
         return []
-    stored = get_posted(ss, service, year, month)
+    if confirmed:
+        text = f"*✅ CONFIRMED SCHEDULE*\n\n{text}"
     if create:
         targets = summary_target_chat_ids(ss, service)
         if not targets:
@@ -3252,7 +3511,7 @@ async def post_or_update_summary(context, ss, service, year, month, create):
     posted = updated = 0
     problems = []
     for chat_id in targets:
-        markup = schedule_feedback_keyboard(service, year, month, chat_id)
+        markup = None if confirmed else schedule_feedback_keyboard(service, year, month, chat_id)
         message_id = stored.get(str(chat_id))
         if message_id:
             try:
@@ -3260,6 +3519,8 @@ async def post_or_update_summary(context, ss, service, year, month, create):
                     chat_id=int(chat_id), message_id=message_id, text=text, parse_mode="Markdown",
                     reply_markup=markup,
                 )
+                save_posted(ss, service, year, month, chat_id, message_id,
+                            "confirmed" if confirmed else "review")
                 updated += 1
                 continue
             except BadRequest as e:
@@ -3271,6 +3532,8 @@ async def post_or_update_summary(context, ss, service, year, month, create):
                     except BadRequest as markup_error:
                         if "not modified" not in str(markup_error).lower():
                             raise
+                    save_posted(ss, service, year, month, chat_id, message_id,
+                                "confirmed" if confirmed else "review")
                     updated += 1
                     continue
                 # message was deleted / can't be edited: fall through and post a fresh one
@@ -3284,7 +3547,8 @@ async def post_or_update_summary(context, ss, service, year, month, create):
         except TelegramError as e:
             problems.append(f"⚠️ Couldn't post to group {chat_id}: {e}")
             continue
-        save_posted(ss, service, year, month, chat_id, msg.message_id)
+        save_posted(ss, service, year, month, chat_id, msg.message_id,
+                    "confirmed" if confirmed else "review")
         posted += 1
         try:
             await context.bot.pin_chat_message(
@@ -3349,9 +3613,22 @@ async def refresh_all_posts(context, ss):
 def post_confirm_markup(service, year, month):
     key = f"{service}:{year}-{month}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Looks good — post & pin to groups", callback_data=f"post:yes:{key}")],
+        [InlineKeyboardButton(
+            "✅ Post review to Main Departments" if service == "SunStopSundays"
+            else "✅ Looks good — post & pin to groups",
+            callback_data=f"post:yes:{key}",
+        )],
         [InlineKeyboardButton("✏️ I need to adjust first", callback_data=f"post:adjust:{key}")],
     ])
+
+
+def confirmed_schedule_markup(service, year, month):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📣 Repost as Confirmed Schedule",
+            callback_data=f"post:confirmed:{service}:{year}-{month}",
+        )
+    ]])
 
 
 async def post_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3396,6 +3673,16 @@ async def post_summary_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    if action == "confirmed":
+        await query.edit_message_text("Reposting the Confirmed Schedule to the related groups...")
+        lines = await post_or_update_summary(
+            context, ss, service, year, month, create=True, confirmed=True
+        )
+        await query.edit_message_text(
+            "\n".join(lines) or f"No {service} schedule found for {month_label} yet — nothing reposted."
+        )
+        return
+
     if action == "adjust":
         key = f"{service}:{year}-{month}"
         await query.edit_message_text(
@@ -3412,7 +3699,9 @@ async def post_summary_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Posting to the groups...")
         lines = await post_or_update_summary(context, ss, service, year, month, create=True)
         await query.edit_message_text(
-            "\n".join(lines) or f"No {service} schedule found for {month_label} yet — nothing posted."
+            ("\n".join(lines) or f"No {service} schedule found for {month_label} yet — nothing posted.")
+            + "\n\nAfter all partakers have confirmed the schedule, use the button below to repost it as final.",
+            reply_markup=confirmed_schedule_markup(service, year, month),
         )
 
 
@@ -5852,19 +6141,19 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
         text = (f"⚠️ Something went wrong ({type(err).__name__}). "
                 f"Please try again in a moment — if it keeps happening, tell the admin.")
 
-    # If this came from a button tap, replace the stuck message (e.g. "Generating
-    # schedule...") so it never just hangs; otherwise send a fresh reply.
+    # Never replace a callback's original message: it may be a pinned group
+    # schedule whose text and buttons must remain available after a failed tap.
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(text, show_alert=True)
+            return
+        except Exception:
+            pass  # expired callback; fall through to a separate reply
     try:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text)
-        elif update.effective_message:
+        if update.effective_message:
             await update.effective_message.reply_text(text)
     except Exception:
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text(text)
-        except Exception:
-            pass
+        pass
 
 
 def build_app():
@@ -5950,6 +6239,15 @@ def build_app():
                 CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
                 CallbackQueryHandler(tech_confirm_conflict),
             ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    sunstop_rep_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(sunstop_rep_start, pattern=r"^sunstop:rep:")],
+        states={
+            SUNSTOP_REP_DEPARTMENT: [CallbackQueryHandler(sunstop_rep_select_department, pattern=r"^sunstop:dept:")],
+            SUNSTOP_REP_SLOT: [CallbackQueryHandler(sunstop_rep_select_slot, pattern=r"^sunstop:slot:")],
+            SUNSTOP_REP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sunstop_rep_enter_name)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -6085,6 +6383,9 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    # Put representative intake first so a group button starts reliably even
+    # when that same user has another conversation open with the bot.
+    app.add_handler(sunstop_rep_conv)
     app.add_handler(generate_conv)
     app.add_handler(preacher_conv)
     app.add_handler(predawn_conv)
