@@ -423,7 +423,10 @@ def setup_sheet():
             ws.append_row(TAB_HEADERS[tab])
         else:
             ws = ss.worksheet(tab)
-            if ws.row_values(1) != TAB_HEADERS[tab]:
+            current_headers = ws.row_values(1)
+            if tab == "Roster" and current_headers[:2] == ["Name", "AssignmentCount"]:
+                ws.update(range_name="A1:D1", values=[TAB_HEADERS[tab]])
+            elif current_headers != TAB_HEADERS[tab]:
                 ws.update(range_name="A1", values=[TAB_HEADERS[tab]])
 
     # seed roster (individuals across all services, plus Sun Stop Sundays departments,
@@ -441,7 +444,7 @@ def setup_sheet():
             all_names.update(members)
     new_names = sorted(all_names - existing_names)
     if new_names:
-        roster_ws.append_rows([[name, 0] for name in new_names])
+        roster_ws.append_rows([[name, 0, "", ""] for name in new_names])
 
     # seed ServiceConfig with the built-in services' role setup, so custom
     # services added later via /add_service live in the same place and
@@ -596,7 +599,7 @@ def save_assignment_counts(ss, counts):
             values=[[counts.get(n, 0)] for n in names],
         )
     known = set(names)
-    new_rows = [[n, c] for n, c in counts.items() if n not in known]
+    new_rows = [[n, c, "", ""] for n, c in counts.items() if n not in known]
     if new_rows:
         roster_ws.append_rows(new_rows)
 
@@ -1462,9 +1465,10 @@ async def select_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_schedule_rows(ss, service_type, schedule_rows, skip_preacher_rows=True, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
+    month_rows = records_to_rows(rows_in_month(ss.worksheet(service_type).get_all_records(), year, month))
     summary = format_schedule_summary(
         service_type, add_tech_rows(
-            ss, service_type, add_filipino_preacher_rows(ss, service_type, schedule_rows)
+            ss, service_type, add_filipino_preacher_rows(ss, service_type, month_rows)
         )
     )
     await query.message.reply_text(summary, parse_mode="Markdown")
@@ -1697,10 +1701,11 @@ async def select_sunstop_month(update: Update, context: ContextTypes.DEFAULT_TYP
     append_schedule_rows(ss, "SunStopSundays", schedule_rows, skip_keys=already_filled)
     save_assignment_counts(ss, counts)
 
+    month_rows = records_to_rows(rows_in_month(ss.worksheet("SunStopSundays").get_all_records(), year, month))
     summary = format_schedule_summary(
         "Sun Stop Sundays",
         sunstop_summary_rows_with_representatives(
-            ss, add_tech_rows(ss, "SunStopSundays", schedule_rows)
+            ss, add_tech_rows(ss, "SunStopSundays", month_rows)
         ),
     )
     await query.message.reply_text(summary, parse_mode="Markdown")
@@ -3015,42 +3020,35 @@ def format_daily_reminder(service_type, date, rows, ss=None):
 # the whole message.
 
 async def send_sunday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Runs daily at 8:30PM but only actually sends on Wednesday — reminds
-    about the upcoming Sunday service (4 days out)."""
+    """Runs at 6AM Saturday Manila time and reminds about Sunday's service."""
     now = dt.datetime.now(CHURCH_TZ)
-    if now.weekday() != 2:  # Wednesday
+    if now.weekday() != 5:  # Saturday
         return
     ss = setup_sheet()
-    chat_id = get_group_chat_id(ss, "Service Partakers")
-    if not chat_id:
-        return
-    target = now.date() + dt.timedelta(days=4)
+    target = now.date() + dt.timedelta(days=1)
     rows = get_rows_for_date(ss, "Sunday", target)
     text = format_daily_reminder("Sunday", target, rows, ss)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    for chat_id in summary_target_chat_ids(ss, "Sunday"):
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 async def send_wednesday_service_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Runs daily at 7PM but only actually sends on Sunday — reminds about
-    the Wednesday service that follows (3 days out)."""
+    """Runs at 7PM Tuesday Manila time and reminds about Wednesday's service."""
     now = dt.datetime.now(CHURCH_TZ)
-    if now.weekday() != 6:  # Sunday
+    if now.weekday() != 1:  # Tuesday
         return
     ss = setup_sheet()
-    chat_id = get_group_chat_id(ss, "Service Partakers")
-    if not chat_id:
-        return
-    target = now.date() + dt.timedelta(days=3)
+    target = now.date() + dt.timedelta(days=1)
     rows = get_rows_for_date(ss, "Wednesday", target)
     text = format_daily_reminder("Wednesday", target, rows, ss)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    for chat_id in summary_target_chat_ids(ss, "Wednesday"):
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Runs daily at 8PM but only actually sends on Friday — reminds about
     the upcoming Sunday's Filipino Translation roles (to the Filipino
-    Translators group) and Sun Stop Sundays roles (to Service Partakers),
-    both 2 days out. Predawn has no reminder at all."""
+    Translators group). Predawn has no reminder at all."""
     now = dt.datetime.now(CHURCH_TZ)
     if now.weekday() != 4:  # Friday
         return
@@ -3065,11 +3063,82 @@ async def send_friday_reminder(context: ContextTypes.DEFAULT_TYPE):
         text = f"Filipino Translation Team\n{target.strftime('%B %d, %Y')}\n\n{body}"
         await context.bot.send_message(chat_id=fil_chat_id, text=text, parse_mode="HTML")
 
-    partaker_chat_id = get_group_chat_id(ss, "Service Partakers")
-    if partaker_chat_id:
-        rows = get_rows_for_date(ss, "SunStopSundays", target)
-        text = format_daily_reminder("SunStopSundays", target, rows, ss)
-        await context.bot.send_message(chat_id=partaker_chat_id, text=text, parse_mode="HTML")
+async def send_sunstop_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Runs at 3PM Saturday Manila time and reminds Sun Stop's two groups."""
+    now = dt.datetime.now(CHURCH_TZ)
+    if now.weekday() != 5:  # Saturday
+        return
+    ss = setup_sheet()
+    target = now.date() + dt.timedelta(days=1)
+    rows = get_rows_for_date(ss, "SunStopSundays", target)
+    text = format_daily_reminder("SunStopSundays", target, rows, ss)
+    for chat_id in summary_target_chat_ids(ss, "SunStopSundays"):
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
+POST_REMINDER_SERVICE, POST_REMINDER_DATE = range(190, 192)
+
+
+async def post_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Sunday", callback_data="Sunday")],
+        [InlineKeyboardButton("Wednesday", callback_data="Wednesday")],
+        [InlineKeyboardButton("Sun Stop Sundays", callback_data="SunStopSundays")],
+    ])
+    await update.message.reply_text("Which service reminder should I post?", reply_markup=keyboard)
+    return POST_REMINDER_SERVICE
+
+
+async def post_reminder_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service = query.data
+    if service not in ("Sunday", "Wednesday", "SunStopSundays"):
+        await query.edit_message_text("That service isn't available for manual reminders.")
+        return ConversationHandler.END
+    context.user_data["manual_reminder_service"] = service
+    await query.edit_message_text(
+        f"Enter the {service.replace('SunStopSundays', 'Sun Stop Sundays')} date as YYYY-MM-DD."
+    )
+    return POST_REMINDER_DATE
+
+
+async def post_reminder_enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    service = context.user_data.get("manual_reminder_service")
+    try:
+        target = dt.date.fromisoformat((update.message.text or "").strip())
+    except ValueError:
+        await update.message.reply_text("Use a valid date in YYYY-MM-DD format.")
+        return POST_REMINDER_DATE
+    if service not in ("Sunday", "Wednesday", "SunStopSundays"):
+        await update.message.reply_text("This reminder form expired. Start again from the menu.")
+        return ConversationHandler.END
+    if target.weekday() != SERVICE_WEEKDAY[service]:
+        expected = "Wednesday" if service == "Wednesday" else "Sunday"
+        await update.message.reply_text(f"{service.replace('SunStopSundays', 'Sun Stop Sundays')} must be on a {expected}.")
+        return POST_REMINDER_DATE
+
+    ss = setup_sheet()
+    rows = get_rows_for_date(ss, service, target)
+    text = format_daily_reminder(service, target, rows, ss)
+    chat_ids = summary_target_chat_ids(ss, service)
+    if not chat_ids:
+        await update.message.reply_text("No related groups are registered for that service in GroupChats.")
+        return ConversationHandler.END
+
+    posted, failures = 0, []
+    for chat_id in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            posted += 1
+        except TelegramError as exc:
+            failures.append(f"{chat_id}: {exc}")
+    result = f"Reminder posted to {posted} group(s) for {target.strftime('%B %d, %Y')}."
+    if failures:
+        result += "\nCouldn't post to: " + "; ".join(failures)
+    await update.message.reply_text(result)
+    context.user_data.pop("manual_reminder_service", None)
+    return ConversationHandler.END
 
 
 # --- /set_group_chat: run inside a Telegram group to register it as the
@@ -3085,7 +3154,7 @@ async def set_group_chat_start(update: Update, context: ContextTypes.DEFAULT_TYP
     buttons = [
         [InlineKeyboardButton("Service Partakers (everyone)", callback_data="Service Partakers")],
         [InlineKeyboardButton("Filipino Translators", callback_data="Filipino Translators")],
-        [InlineKeyboardButton("Main Departments", callback_data="Main Departments")],
+        [InlineKeyboardButton("Main Departments (Sun Stop Sundays)", callback_data="Main Departments")],
     ] + [[InlineKeyboardButton(role, callback_data=role)] for role in role_group_purposes(ss)]
     await update.message.reply_text(
         "Register this group for which reminders? Pick 'Service Partakers' for a group covering "
@@ -3386,20 +3455,13 @@ POSTED_SERVICES = ("Sunday", "Wednesday", "SunStopSundays")
 
 
 def summary_target_chat_ids(ss, service):
-    """Groups that get this service's monthly summary:
-    Sunday    -> Service Partakers, Filipino Translators, and every role group (Praise Leader, Presider, Representative Prayer)
-    Wednesday -> Service Partakers and every role group (Presider, Representative Prayer)
-    SunStopSundays -> Main Departments and Praise Leader groups"""
-    if service == "Sunday":
-        purposes = ["Service Partakers", "Filipino Translators"]
-    elif service == "Wednesday":
-        purposes = ["Service Partakers"]
-    elif service == "SunStopSundays":
-        purposes = ["Main Departments", "Praise Leader"]
+    """Groups that get each monthly schedule summary."""
+    if service == "SunStopSundays":
+        purposes = ["Praise Leader", "Main Departments"]
+    elif service in ("Sunday", "Wednesday"):
+        purposes = ["Praise Leader", "Presider", "Representative Prayer"]
     else:
         return []
-    if service in ("Sunday", "Wednesday"):
-        purposes += list(get_random_roles_for_service(ss, service).keys())
     seen, ids = set(), []
     for purpose in purposes:
         chat_id = get_group_chat_id(ss, purpose)
@@ -3523,6 +3585,7 @@ async def post_or_update_summary(context, ss, service, year, month, create, conf
         return []
     if confirmed:
         text = f"*✅ CONFIRMED SCHEDULE*\n\n{text}"
+    stored = get_posted(ss, service, year, month)
     if create:
         targets = summary_target_chat_ids(ss, service)
         if not targets:
@@ -3536,7 +3599,7 @@ async def post_or_update_summary(context, ss, service, year, month, create, conf
     for chat_id in targets:
         markup = None if confirmed else schedule_feedback_keyboard(service, year, month, chat_id)
         message_id = stored.get(str(chat_id))
-        if message_id:
+        if message_id and not confirmed:
             try:
                 await context.bot.edit_message_text(
                     chat_id=int(chat_id), message_id=message_id, text=text, parse_mode="Markdown",
@@ -3718,9 +3781,11 @@ async def post_summary_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    if action == "yes":
+    if action in ("yes", "confirmed"):
         await query.edit_message_text("Posting to the groups...")
-        lines = await post_or_update_summary(context, ss, service, year, month, create=True)
+        lines = await post_or_update_summary(
+            context, ss, service, year, month, create=True, confirmed=(action == "confirmed")
+        )
         await query.edit_message_text(
             ("\n".join(lines) or f"No {service} schedule found for {month_label} yet — nothing posted.")
             + "\n\nAfter all partakers have confirmed the schedule, use the button below to repost it as final.",
@@ -6091,6 +6156,7 @@ MENU_TITLE = "Scheduling menu — what would you like to do?"
 
 MAIN_MENU_ROWS = [
     [_menu_btn("📅 Generate schedule", "generate")],
+    [_menu_btn("🔔 Post reminder", "post_reminder")],
     [_menu_btn("📌 Review & post summary", "post_summary")],
     [_menu_btn("🎤 Set preacher", "set_preacher"), _menu_btn("🌄 Set Predawn pattern", "set_predawn_pattern")],
     [_menu_btn("🎛 Log tech", "log_tech"), _menu_btn("📝 Log a role", "log_role")],
@@ -6173,6 +6239,9 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(err, _GspreadAPIError) and status == 429:
         text = ("⚠️ Google Sheets is rate-limiting me right now (too many requests). "
                 "Please wait about a minute and try again.")
+    elif isinstance(err, BadRequest):
+        detail = " ".join(str(err).split())[:180]
+        text = f"⚠️ Telegram rejected that request: {detail or 'Bad Request'}. Please report this message to the admin."
     else:
         text = (f"⚠️ Something went wrong ({type(err).__name__}). "
                 f"Please try again in a moment — if it keeps happening, tell the admin.")
@@ -6217,6 +6286,15 @@ def build_app():
             SELECT_SUNSTOP_MONTH: [CallbackQueryHandler(select_sunstop_month)],
             PREDAWN_PATTERN_DAY: [CallbackQueryHandler(predawn_pattern_pick_day)],
             GEN_SVC_SELECT_PERIOD: [CallbackQueryHandler(generate_service_period)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    post_reminder_conv = ConversationHandler(
+        entry_points=[CommandHandler("post_reminder", post_reminder_start),
+                      menu_entry("post_reminder", post_reminder_start)],
+        states={
+            POST_REMINDER_SERVICE: [CallbackQueryHandler(post_reminder_select_service)],
+            POST_REMINDER_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_reminder_enter_date)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -6412,6 +6490,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(generate_conv)
+    app.add_handler(post_reminder_conv)
     app.add_handler(preacher_conv)
     app.add_handler(predawn_conv)
     app.add_handler(sunstop_conv)
@@ -6442,9 +6521,10 @@ def build_app():
     # #4: nightly reminder jobs (Asia/Manila). run_daily fires once per day;
     # each callback itself decides whether today/tomorrow actually needs a
     # reminder, so a single daily job safely covers every service.
-    app.job_queue.run_daily(send_sunday_service_reminder, time=dt.time(hour=20, minute=30, tzinfo=CHURCH_TZ))
+    app.job_queue.run_daily(send_sunday_service_reminder, time=dt.time(hour=6, minute=0, tzinfo=CHURCH_TZ))
     app.job_queue.run_daily(send_wednesday_service_reminder, time=dt.time(hour=19, minute=0, tzinfo=CHURCH_TZ))
     app.job_queue.run_daily(send_friday_reminder, time=dt.time(hour=20, minute=0, tzinfo=CHURCH_TZ))
+    app.job_queue.run_daily(send_sunstop_reminder, time=dt.time(hour=15, minute=0, tzinfo=CHURCH_TZ))
 
     open_preferences_conv = ConversationHandler(
         entry_points=[CommandHandler("open_preferences", open_preferences_start), menu_entry("open_preferences", open_preferences_start)],
