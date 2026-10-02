@@ -2838,18 +2838,31 @@ SUNSTOP_REP_DEPARTMENT, SUNSTOP_REP_SLOT, SUNSTOP_REP_NAME = range(210, 213)
 
 
 async def sunstop_rep_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Redirect legacy group callback buttons into the private representative form."""
     query = update.callback_query
-    try:
-        await query.answer()
-    except BadRequest:
-        pass  # still process the submission if Telegram has expired the spinner
     try:
         _prefix, _action, year, month = query.data.split(":")
         year, month = int(year), int(month)
+        if not 1 <= month <= 12:
+            raise ValueError
     except (ValueError, AttributeError):
-        await query.message.reply_text("That Sun Stop schedule link is invalid.")
+        await query.answer("That Sun Stop schedule link is invalid.", show_alert=True)
         return ConversationHandler.END
+    url = f"https://t.me/{BOT_USERNAME}?start=rep_{year}_{month}_{abs(int(query.message.chat_id))}"
+    try:
+        await query.answer(url=url)
+    except BadRequest:
+        try:
+            await query.answer("Please open the bot in a direct message to submit your representative.", show_alert=True)
+        except BadRequest:
+            pass
+    return ConversationHandler.END
 
+
+async def sunstop_rep_dm_start(update: Update, context: ContextTypes.DEFAULT_TYPE, year, month):
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Please open this form in a direct message with the bot.")
+        return ConversationHandler.END
     ss = setup_sheet()
     schedule = rows_in_month(ss.worksheet("SunStopSundays").get_all_records(), year, month)
     departments = sorted({r.get("Partaker") for r in schedule if r.get("Partaker") in SUN_STOP_DEPTS})
@@ -2860,10 +2873,10 @@ async def sunstop_rep_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = [[InlineKeyboardButton(dept, callback_data=f"sunstop:dept:{i}")]
                for i, dept in enumerate(departments)]
     if not buttons:
-        await query.message.reply_text("No department assignments are available for that schedule.")
+        await update.effective_message.reply_text("No department assignments are available for that schedule.")
         return ConversationHandler.END
-    await query.message.reply_text(
-        f"{query.from_user.full_name}, choose the department you are submitting for:",
+    await update.effective_message.reply_text(
+        "Choose the department you are submitting for:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return SUNSTOP_REP_DEPARTMENT
@@ -3440,10 +3453,13 @@ def save_posted(ss, service, year, month, chat_id, message_id, status="review"):
 def schedule_feedback_keyboard(service, year, month, chat_id):
     adjust_url = f"https://t.me/{BOT_USERNAME}?start=adjust_{service}_{year}_{month}_{abs(int(chat_id))}"
     if service == "SunStopSundays":
+        representative_url = (
+            f"https://t.me/{BOT_USERNAME}?start=rep_{year}_{month}_{abs(int(chat_id))}"
+        )
         return InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "Main Department heads: Who's your rep?",
-                callback_data=f"sunstop:rep:{year}:{month}",
+                url=representative_url,
             )],
             [InlineKeyboardButton(
                 "For PLs - Looks good. I'm ok with my schedule",
@@ -5722,6 +5738,19 @@ def get_round_partaker_names(ss, round_):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
+    if args and args[0].startswith("rep_"):
+        pieces = args[0].split("_")
+        if len(pieces) == 4:
+            try:
+                year, month, _source_chat = int(pieces[1]), int(pieces[2]), int(pieces[3])
+                if not 1 <= month <= 12:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("That representative form link is invalid.")
+                return ConversationHandler.END
+            return await sunstop_rep_dm_start(update, context, year, month)
+        await update.message.reply_text("That representative form link is invalid.")
+        return ConversationHandler.END
     if args and args[0].startswith("adjust_"):
         pieces = args[0].split("_")
         if len(pieces) == 5:
@@ -6176,6 +6205,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(from_menu(post_summary_command), pattern=r"^menu:post_summary$"))
     app.add_handler(CallbackQueryHandler(post_summary_callback, pattern=r"^post:"))
     app.add_handler(CallbackQueryHandler(schedule_feedback_callback, pattern=r"^schedule:confirm:"))
+    app.add_handler(CallbackQueryHandler(sunstop_rep_start, pattern=r"^sunstop:rep:"))
 
     generate_conv = ConversationHandler(
         entry_points=[CommandHandler("generate", generate_schedule_start), menu_entry("generate", generate_schedule_start)],
@@ -6246,15 +6276,6 @@ def build_app():
                 CallbackQueryHandler(tech_menu_restart, pattern=r"^menu:log_tech$"),
                 CallbackQueryHandler(tech_confirm_conflict),
             ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    sunstop_rep_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(sunstop_rep_start, pattern=r"^sunstop:rep:")],
-        states={
-            SUNSTOP_REP_DEPARTMENT: [CallbackQueryHandler(sunstop_rep_select_department, pattern=r"^sunstop:dept:")],
-            SUNSTOP_REP_SLOT: [CallbackQueryHandler(sunstop_rep_select_slot, pattern=r"^sunstop:slot:")],
-            SUNSTOP_REP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sunstop_rep_enter_name)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -6390,9 +6411,6 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    # Put representative intake first so a group button starts reliably even
-    # when that same user has another conversation open with the bot.
-    app.add_handler(sunstop_rep_conv)
     app.add_handler(generate_conv)
     app.add_handler(preacher_conv)
     app.add_handler(predawn_conv)
@@ -6443,6 +6461,9 @@ def build_app():
         states={
             PREF_SELECT_NAME: [CallbackQueryHandler(pref_select_name)],
             PREF_SELECT_DATE: [CallbackQueryHandler(pref_select_date)],
+            SUNSTOP_REP_DEPARTMENT: [CallbackQueryHandler(sunstop_rep_select_department, pattern=r"^sunstop:dept:")],
+            SUNSTOP_REP_SLOT: [CallbackQueryHandler(sunstop_rep_select_slot, pattern=r"^sunstop:slot:")],
+            SUNSTOP_REP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sunstop_rep_enter_name)],
             CANCEL_NAME: [CallbackQueryHandler(cancel_select_name)],
             CANCEL_PICK: [CallbackQueryHandler(cancel_pick_entry)],
             CANCEL_REPLACEMENT: [CallbackQueryHandler(cancel_pick_replacement)],
