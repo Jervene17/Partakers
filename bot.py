@@ -3441,7 +3441,14 @@ def schedule_feedback_keyboard(service, year, month, chat_id):
     adjust_url = f"https://t.me/{BOT_USERNAME}?start=adjust_{service}_{year}_{month}_{abs(int(chat_id))}"
     if service == "SunStopSundays":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧑‍💼 Log your representative", callback_data=f"sunstop:rep:{year}:{month}")],
+            [InlineKeyboardButton(
+                "Main Department heads: Who's your rep?",
+                callback_data=f"sunstop:rep:{year}:{month}",
+            )],
+            [InlineKeyboardButton(
+                "For PLs - Looks good. I'm ok with my schedule",
+                callback_data=f"schedule:confirm:{service}:{year}:{month}",
+            )],
             [InlineKeyboardButton("✏️ Adjust my schedule", url=adjust_url)],
         ])
     return InlineKeyboardMarkup([
