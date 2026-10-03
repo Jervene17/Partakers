@@ -2746,7 +2746,7 @@ PREP_SCHEDULE_WEDNESDAY_TEMPLATE = (
 REMINDER_FOOTER = (
     "would like to remind everyone for us to keep the schedule of service preparation "
     "including sending scripts, rep prayer, praise practice, Presider's part, Preacher, "
-    "tech dry run and cleaning church ~ 😋🙂😄😘😘😘"
+    "tech dry run and cleaning church."
 )
 
 # Display label -> sheet Role name, in the order they should print.
@@ -4143,6 +4143,8 @@ async def substitute_select_date(update: Update, context: ContextTypes.DEFAULT_T
     ws = ss.worksheet(service)
     _, current = get_role_row(ws, role, date_str)
     candidates = available_replacements(ss, service, date_str, role, current)
+    if "M.Rose (last minute sub)" != current:
+        candidates.append("M.Rose (last minute sub)")
     buttons = [[InlineKeyboardButton(name, callback_data=name)] for name in candidates]
     if current != TBA:
         buttons.append([InlineKeyboardButton("TBA", callback_data=TBA)])
