@@ -2765,6 +2765,21 @@ def get_rows_for_date(ss, service_type, date):
     ws = ss.worksheet(service_type)
     date_str = date.isoformat()
     rows = [r for r in ws.get_all_records() if r.get("Date") == date_str]
+    # Tech is logged separately and may not be present in the service tab.
+    # Include every logged Tech member so reminders reflect the current log.
+    tech_roles = set(TECH_ROLES_BY_SERVICE.get(service_type, {}))
+    if tech_roles:
+        sync_tech_log(ss)
+        present = {(r.get("Role"), r.get("Partaker")) for r in rows}
+        for tech_row in ss.worksheet("Tech").get_all_records():
+            role = str(tech_row.get("Role") or "").strip()
+            partaker = tech_row.get("Partaker")
+            if (tech_row.get("Service") == service_type and tech_row.get("Date") == date_str
+                    and (role in tech_roles or "tech" in role.casefold()) and partaker
+                    and (role, partaker) not in present):
+                rows.append({"Date": date_str, "Role": role, "Partaker": partaker,
+                             "Status": tech_row.get("Status") or "scheduled"})
+                present.add((role, partaker))
     if service_type == "SunStopSundays":
         rows = sunstop_rows_with_representatives(ss, rows)
     return rows
@@ -2984,7 +2999,15 @@ def format_daily_reminder(service_type, date, rows, ss=None):
     header = f"{html.escape(SERVICE_DISPLAY_NAME[service_type])}\n{date.strftime('%B %d, %Y')}\n\n"
 
     if service_type in REMINDER_ROLE_ORDER:
-        lines = [f"{html.escape(label)} - {display(lookup.get(role, 'TBA'))}" for label, role in REMINDER_ROLE_ORDER[service_type]]
+        lines = []
+        for label, role in REMINDER_ROLE_ORDER[service_type]:
+            if role in TECH_ROLES_BY_SERVICE.get(service_type, {}):
+                tech_people = [display(r.get("Partaker")) for r in rows
+                               if r.get("Role") == role and r.get("Partaker")]
+                partaker = ", ".join(tech_people) if tech_people else display("TBA")
+            else:
+                partaker = display(lookup.get(role, "TBA"))
+            lines.append(f"{html.escape(label)} - {partaker}")
         body = "\n".join(lines)
         if service_type == "Sunday":
             prep = PREP_SCHEDULE_SUNDAY
